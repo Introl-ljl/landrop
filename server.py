@@ -30,6 +30,7 @@ import secrets
 import shutil
 import socket
 import sys
+import socketserver
 import threading
 import time
 from http import HTTPStatus
@@ -1116,8 +1117,16 @@ def prepare(data_dir: str, share_dir: str = "", space_name: str = "共享空间"
     }
 
 
+class _Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # 标准库的 HTTPServer.server_bind 会调用 socket.getfqdn() 做反向 DNS，
+        # 在 macOS/无 DNS 环境里可能卡几十秒；这里只绑定，不做名字解析。
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def make_server(host: str, port: int) -> ThreadingHTTPServer:
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd = _Server((host, port), Handler)
     httpd.daemon_threads = True
     return httpd
 
