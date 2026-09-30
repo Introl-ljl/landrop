@@ -105,30 +105,40 @@ def main():
     tmp = tempfile.mkdtemp(prefix="landrop-selftest-")
     data_dir = os.path.join(tmp, "data")
     port = free_port()
+    # 服务输出写到文件而不是管道：没人读的管道被写满后（Windows 缓冲区很小），服务会卡在打印日志上
+    log_path = os.path.join(tmp, "server.log")
+    log_fh = open(log_path, "wb")
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "server.py"),
          "--data-dir", data_dir, "--host", "127.0.0.1", "--port", str(port),
          "--admin-key", "admin-secret-123"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        encoding="utf-8", errors="replace",
+        stdout=log_fh, stderr=subprocess.STDOUT,
     )
+
+    def server_log() -> str:
+        log_fh.flush()
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+
     try:
         if not wait_port(port):
-            proc.terminate()      # 先结束进程再读输出，否则 read() 会一直阻塞
+            proc.terminate()
             try:
-                out, _ = proc.communicate(timeout=10)
+                proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                out, _ = proc.communicate()
-            print("服务未能启动:\n", out)
+            print("服务未能启动:\n", server_log())
             return 1
         run_checks(port, data_dir)
     finally:
+        if FAIL:
+            print("\n--- 服务端日志（末尾 40 行）---\n" + "\n".join(server_log().splitlines()[-40:]))
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+        log_fh.close()
         if not args.keep:
             shutil.rmtree(tmp, ignore_errors=True)
         else:
