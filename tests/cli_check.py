@@ -9,11 +9,13 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import queue
 import re
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import faulthandler
@@ -50,6 +52,77 @@ def run(argv):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         rc = landrop.main(argv)
     return rc, out.getvalue(), err.getvalue()
+
+
+def start_direct_sender(args):
+    """以子进程启动直连发送端；后台线程读 stdout，避免读管道把测试卡死。"""
+    proc = subprocess.Popen(
+        [sys.executable, "-u", os.path.join(ROOT, "landrop.py"), "send", *args, "--ip", "127.0.0.1"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+        errors="replace", env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    lines: "queue.Queue[str]" = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(l) for l in proc.stdout], daemon=True).start()
+    code = ""
+    end = time.time() + 20
+    while time.time() < end and not code:
+        try:
+            m = re.search(r"文件码:\s+(\S+)", lines.get(timeout=0.5))
+            code = m.group(1) if m else ""
+        except queue.Empty:
+            if proc.poll() is not None:
+                break
+    return proc, code
+
+
+def direct_checks(tmp):
+    print("\n[直连模式]")
+    src = os.path.join(tmp, "dsrc")
+    os.makedirs(os.path.join(src, "proj", "sub"))
+    payload = os.urandom(400_000)
+    with open(os.path.join(src, "big.bin"), "wb") as f:
+        f.write(payload)
+    with open(os.path.join(src, "proj", "a.txt"), "w") as f:
+        f.write("A")
+    with open(os.path.join(src, "proj", "sub", "b.txt"), "w") as f:
+        f.write("B")
+
+    proc, code = start_direct_sender([os.path.join(src, "big.bin"), os.path.join(src, "proj")])
+    check(bool(code), f"直连 send 输出文件码 {code}")
+    dest = os.path.join(tmp, "direct-out")
+    os.makedirs(dest)
+    with open(os.path.join(dest, "big.bin.part"), "wb") as f:      # 预置断点
+        f.write(payload[:150_000])
+    host, _, tail = code.partition("/")
+    rc, _, _ = run(["get", host + "/wrong-token-xx", "-o", dest])
+    check(rc == 1, "错误令牌被拒绝")
+    rc, out, _ = run(["get", code, "-o", dest])
+    check(rc == 0, "直连 get 成功")
+    check(open(os.path.join(dest, "big.bin"), "rb").read() == payload, "断点续传后内容一致")
+    check(open(os.path.join(dest, "proj", "sub", "b.txt")).read() == "B", "目录结构保留")
+    try:
+        check(proc.wait(timeout=15) == 0, "接收完成后发送端自动退出(0)")
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        check(False, "接收完成后发送端自动退出(0)")
+    rc, _, _ = run(["get", code, "-o", dest])
+    check(rc == 1, "一次性：发送端退出后文件码失效")
+
+    # 错误次数过多 → 发送端自行关闭
+    proc, code = start_direct_sender([os.path.join(src, "big.bin")])
+    host = code.partition("/")[0]
+    for _ in range(5):
+        run(["get", host + "/nope", "-o", dest])
+    try:
+        check(proc.wait(timeout=15) == 1, "连续错误令牌后发送端关闭")
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        check(False, "连续错误令牌后发送端关闭")
+    check(landrop.safe_relpath("a/b/c.txt") == os.path.join("a", "b", "c.txt"), "safe_relpath 正常路径")
+    try:
+        landrop.safe_relpath("../../etc/passwd")
+        check(False, "safe_relpath 拒绝 ..")
+    except landrop.CliError:
+        check(True, "safe_relpath 拒绝 ..")
 
 
 def main():
@@ -106,6 +179,7 @@ def main():
         check(rc == 0, "revoke 成功")
         rc, _, err = run(["get", code, "-o", dest])
         check(rc == 1, "撤销后取件失败")
+        direct_checks(tmp)
     finally:
         proc.terminate()
         try:

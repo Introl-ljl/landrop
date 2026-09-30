@@ -21,6 +21,11 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hmac
+import http.server
+import socket
+import socketserver
+import threading
 import hashlib
 import http.cookiejar
 import json
@@ -218,7 +223,7 @@ def pick_interactively() -> list[str]:
     return chosen
 
 
-def expand_paths(items: list[str]) -> list[str]:
+def expand_paths(items: list[str], allow_dirs: bool = False) -> list[str]:
     out: list[str] = []
     for item in items:
         item = os.path.expanduser(item)
@@ -226,9 +231,9 @@ def expand_paths(items: list[str]) -> list[str]:
         if not matches:
             raise CliError(f"没有匹配：{item}")
         for m in matches:
-            if os.path.isdir(m):
+            if os.path.isdir(m) and not allow_dirs:
                 raise CliError(f"{m} 是目录；请先打包（如 tar/zip）或用通配符选文件")
-            if not os.path.isfile(m):
+            if not (os.path.isfile(m) or os.path.isdir(m)):
                 raise CliError(f"文件不存在：{m}")
             ap = os.path.abspath(m)
             if ap not in out:
@@ -297,7 +302,7 @@ def send_files(server: str, key: str, paths: list[str], expire_hours: float = 24
     }
 
 
-def cmd_send(args) -> int:
+def cmd_send_via_server(args) -> int:
     paths = expand_paths(args.files) if args.files else expand_paths(pick_interactively())
     total_bytes = sum(os.path.getsize(p) for p in paths)
     print(f"上传 {len(paths)} 个文件（{human(total_bytes)}）到 {normalize_base(args.server)} …",
@@ -336,6 +341,287 @@ def _public_url(cli: Client) -> str:
         return ""
 
 
+def cmd_send(args) -> int:
+    """默认直连：本机临时监听，等对方 get；加 --server 才走常驻服务。"""
+    if args.server:
+        return cmd_send_via_server(args)
+    paths = expand_paths(args.files or pick_interactively(), allow_dirs=True)
+    note = lambda m: print(f"  · {m}", file=sys.stderr)  # noqa: E731
+    sender = DirectSender(paths, port=args.port, receivers=args.receivers, on_event=note)
+    print(f"准备 {len(sender.entries)} 个文件（{human(sender.total_bytes)}），计算校验值…",
+          file=sys.stderr)
+    sender.prepare_hashes()
+    sender.start()
+    ips = [args.ip] if args.ip else lan_addresses()
+    code = make_code(f"http://{ips[0]}:{sender.port}", sender.token)
+    print()
+    print(f"文件码:  {code}")
+    print(f"取件命令: {cmd_prefix()} get {code}")
+    print("          （加 -o <目录> 指定保存位置，默认保存到运行命令时所在目录）")
+    if len(ips) > 1 and not args.ip:
+        print("          其他可用地址（若上面的对方连不上，换一个 IP 再试）：" +
+              "  ".join(f"{ip}:{sender.port}" for ip in ips[1:]))
+    print(f"等待接收端连接… 一次性，{args.timeout:g} 分钟内无人取件将自动退出；Ctrl-C 取消。")
+    print("提示：首次监听时系统防火墙可能弹窗，请选择「允许访问」；传输为明文 HTTP，仅限可信局域网。",
+          file=sys.stderr)
+    try:
+        reason = sender.wait(args.timeout * 60)
+    except KeyboardInterrupt:
+        sender.stop("cancelled")
+        reason = "cancelled"
+    messages = {"done": "已送达，发送端退出", "timeout": "超时无人取件，已退出",
+                "failures": "错误尝试过多，已退出", "cancelled": "已取消"}
+    print(messages.get(reason, reason), file=sys.stderr)
+    return {"done": 0, "cancelled": 130}.get(reason, 1)
+
+
+# ------------------------------------------------------------------ 直连发送（去中心化）
+def lan_addresses() -> list[str]:
+    """本机可能被局域网访问到的 IPv4 地址，首选地址排第一（装了 docker/VPN 时可能不止一个）。"""
+    found: list[str] = []
+    try:                       # 不真正发包：只让系统选出默认路由的出口地址
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            found.append(s.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip not in found:
+                found.append(ip)
+    except OSError:
+        pass
+    found = [ip for ip in found if not ip.startswith("127.")]
+    return found or ["127.0.0.1"]
+
+
+class _QuietServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def server_bind(self):     # 跳过 getfqdn 反向 DNS（macOS/无 DNS 环境会卡很久）
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+class DirectSender:
+    """进程内的临时发送服务：说与 LAN Drop 服务端相同的最小 API（login / files / download），
+    所以接收端的 ``get`` 不需要区分对面是直连发送端还是常驻服务。
+
+    一次性：全部接收者完成（/api/done）、超时或失败次数过多后自动关闭。
+    """
+
+    def __init__(self, paths: list[str], token: str | None = None, host: str = "0.0.0.0",
+                 port: int = 0, receivers: int = 1, max_failures: int = 5, on_event=None):
+        self.token = token or secrets.token_urlsafe(12)
+        self.receivers = max(1, receivers)
+        self.max_failures = max_failures
+        self.on_event = on_event or (lambda msg: None)
+        self.entries = self._collect(paths)
+        if not self.entries:
+            raise CliError("没有可发送的文件")
+        self.finished = threading.Event()
+        self.reason = ""
+        self._lock = threading.Lock()
+        self._sessions: set[str] = set()
+        self._failures = 0
+        self._done = 0
+        self._hash_cache: dict[int, str] = {}
+        self.httpd = _QuietServer((host, port), self._make_handler())
+        self.port = self.httpd.server_address[1]
+
+    # ---- 文件清单
+    @staticmethod
+    def _collect(paths):
+        entries, seen = [], set()
+        for p in paths:
+            p = os.path.abspath(p)
+            if os.path.isdir(p):
+                top = os.path.basename(p.rstrip("/\\")) or "folder"
+                for root, dirs, files in os.walk(p):
+                    dirs.sort()
+                    for fn in sorted(files):
+                        full = os.path.join(root, fn)
+                        if os.path.isfile(full):
+                            rel = top + "/" + os.path.relpath(full, p).replace(os.sep, "/")
+                            entries.append((full, rel))
+            elif os.path.isfile(p):
+                entries.append((p, os.path.basename(p)))
+        out = []
+        for full, rel in entries:
+            if rel not in seen:
+                seen.add(rel)
+                out.append({"id": str(len(out)), "path": full, "name": rel,
+                            "size": os.path.getsize(full)})
+        return out
+
+    def prepare_hashes(self, on_progress=None):
+        for e in self.entries:
+            e["sha256"] = sha256_file(e["path"])
+            if on_progress:
+                on_progress(e["name"])
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(e["size"] for e in self.entries)
+
+    # ---- 生命周期
+    def start(self):
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def wait(self, timeout: float | None) -> str:
+        """阻塞到结束；返回原因 done / timeout / failures / cancelled。"""
+        if not self.finished.wait(timeout):
+            self.stop("timeout")
+        return self.reason
+
+    def stop(self, reason: str = "cancelled"):
+        with self._lock:
+            if self.finished.is_set():
+                return
+            self.reason = reason
+            self.finished.set()
+        threading.Thread(target=self._shutdown, daemon=True).start()
+
+    def _shutdown(self):
+        try:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---- HTTP
+    def _make_handler(self):
+        sender = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            server_version = "LANDropDirect"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def _json(self, obj, status=200, headers=None):
+                body = json.dumps(obj).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _body(self):
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    n = 0
+                return self.rfile.read(min(n, 65536)) if n > 0 else b""
+
+            def _authed(self):
+                jar = self.headers.get("Cookie") or ""
+                m = re.search(r"ld_direct=([A-Za-z0-9_-]+)", jar)
+                return bool(m) and m.group(1) in sender._sessions
+
+            def do_POST(self):
+                path = urllib.parse.urlparse(self.path).path
+                if path == "/api/login":
+                    try:
+                        key = str(json.loads(self._body() or b"{}").get("key") or "")
+                    except ValueError:
+                        key = ""
+                    if hmac.compare_digest(key.encode(), sender.token.encode()):
+                        sid = secrets.token_urlsafe(16)
+                        with sender._lock:
+                            sender._sessions.add(sid)
+                        sender.on_event(f"接收端已连接：{self.client_address[0]}")
+                        return self._json({"ok": True, "kind": "direct", "perm": "read",
+                                           "label": "direct"},
+                                          headers={"Set-Cookie": f"ld_direct={sid}; Path=/; HttpOnly"})
+                    time.sleep(0.3)
+                    with sender._lock:
+                        sender._failures += 1
+                        exceeded = sender._failures >= sender.max_failures
+                    self._json({"ok": False, "error": "密钥错误"}, 401)
+                    if exceeded:
+                        sender.on_event("错误密钥尝试次数过多，已关闭发送")
+                        sender.stop("failures")
+                    return
+                if path == "/api/done":
+                    self._body()
+                    if not self._authed():
+                        return self._json({"ok": False, "error": "未登录"}, 401)
+                    with sender._lock:
+                        sender._done += 1
+                        complete = sender._done >= sender.receivers
+                    self._json({"ok": True})
+                    sender.on_event("接收完成")
+                    if complete:
+                        sender.stop("done")
+                    return
+                self._json({"ok": False, "error": "not found"}, 404)
+
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                if not self._authed():
+                    return self._json({"ok": False, "error": "未登录"}, 401)
+                if parsed.path == "/api/files":
+                    return self._json({"ok": True, "files": [
+                        {"id": e["id"], "name": e["name"], "size": e["size"],
+                         "sha256": e.get("sha256", ""), "mtime": 0} for e in sender.entries]})
+                if parsed.path == "/api/download":
+                    return self._download(parsed)
+                self._json({"ok": False, "error": "not found"}, 404)
+
+            def _download(self, parsed):
+                fid = (urllib.parse.parse_qs(parsed.query).get("id") or [""])[0]
+                entry = next((e for e in sender.entries if e["id"] == fid), None)
+                if entry is None:
+                    return self._json({"ok": False, "error": "文件不存在"}, 404)
+                size = entry["size"]
+                start, end, partial = 0, max(size - 1, 0), False
+                rng = self.headers.get("Range") or ""
+                m = re.match(r"bytes=(\d*)-(\d*)$", rng)
+                if size and m and (m.group(1) or m.group(2)):
+                    if m.group(1):
+                        start = int(m.group(1))
+                        if m.group(2):
+                            end = min(int(m.group(2)), size - 1)
+                    else:
+                        start = max(0, size - int(m.group(2)))
+                    if start > end or start >= size:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    partial = True
+                length = end - start + 1 if size else 0
+                self.send_response(206 if partial else 200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                if entry.get("sha256"):
+                    self.send_header("X-File-SHA256", entry["sha256"])
+                if partial:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                try:
+                    with open(entry["path"], "rb") as f:
+                        f.seek(start)
+                        left = length
+                        while left > 0:
+                            chunk = f.read(min(1024 * 1024, left))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            left -= len(chunk)
+                    if end >= size - 1:
+                        sender.on_event(f"已发送：{entry['name']}  ({human(size)})")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        return Handler
+
+
 # ------------------------------------------------------------------ 接收
 def unique_path(directory: str, name: str) -> str:
     stem, ext = os.path.splitext(name)
@@ -362,37 +648,60 @@ def safe_local_name(name: str) -> str:
     return name
 
 
+def safe_relpath(rel: str) -> str:
+    """把对端给的相对路径清洗成本地安全路径：逐段清洗，拒绝 ..、空段与绝对路径。"""
+    parts = [p for p in rel.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        raise CliError(f"不安全的路径：{rel!r}")
+    return os.path.join(*[safe_local_name(p) for p in parts])
+
+
 def download_file(cli: Client, item: dict, directory: str, force: bool,
-                  on_progress=progress) -> str:
-    name = safe_local_name(item["name"])
-    target = os.path.join(directory, name) if force else unique_path(directory, name)
+                  on_progress=progress, _retry=True) -> str:
+    rel = safe_relpath(item.get("path") or item["name"])
+    name = os.path.basename(rel)
+    target = os.path.join(directory, rel) if force else unique_path(directory, rel)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
     part = target + ".part"
+
+    resume = os.path.getsize(part) if os.path.exists(part) else 0
+    size = int(item.get("size") or 0)
+    if resume and resume >= size:          # 残留分块不可信：从头来
+        resume = 0
+    headers = {"Range": f"bytes={resume}-"} if resume else {}
     resp = cli.request("GET", "/api/download?" + urllib.parse.urlencode({"id": item["id"]}),
-                       timeout=300, raw=True)
+                       headers=headers, timeout=300, raw=True)
+    if resume and resp.status != 206:      # 对端不支持续传
+        resume = 0
     expect = (resp.headers.get("X-File-SHA256") or item.get("sha256") or "").lower()
-    total = int(resp.headers.get("Content-Length") or item.get("size") or 0)
-    h, done = hashlib.sha256(), 0
-    try:
-        with resp, open(part, "wb") as f:
-            while True:
-                block = resp.read(1024 * 1024)
-                if not block:
-                    break
-                f.write(block)
+    total = size or (int(resp.headers.get("Content-Length") or 0) + resume)
+    h = hashlib.sha256()
+    if resume:                              # 续传：先把已有部分并入摘要
+        with open(part, "rb") as old:
+            for block in iter(lambda: old.read(1024 * 1024), b""):
                 h.update(block)
-                done += len(block)
-                on_progress(name, done, total)
-        if total and done != total:
-            raise CliError(f"{name}：下载不完整（{done}/{total}）")
-        if expect and h.hexdigest() != expect:
-            raise CliError(f"{name}：SHA-256 校验失败，已丢弃")
-        os.replace(part, target)
-    except BaseException:
+    done = resume
+    with resp, open(part, "ab" if resume else "wb") as f:
+        while True:
+            block = resp.read(1024 * 1024)
+            if not block:
+                break
+            f.write(block)
+            h.update(block)
+            done += len(block)
+            on_progress(name, done, total)
+    # 网络中断：保留 .part，下次 get 会从断点继续
+    if total and done != total:
+        raise CliError(f"{name}：下载不完整（{done}/{total}），重新运行 get 可续传")
+    if expect and h.hexdigest() != expect:
         try:
             os.remove(part)
         except OSError:
             pass
-        raise
+        if resume and _retry:               # 续传拼出的内容不对：整份重下一次
+            return download_file(cli, item, directory, force, on_progress, _retry=False)
+        raise CliError(f"{name}：SHA-256 校验失败，已丢弃")
+    os.replace(part, target)
     return target
 
 
@@ -421,6 +730,10 @@ def fetch_files(code: str, directory: str, only=None, force: bool = False,
         saved.append(target)
         if on_done:
             on_done(item, target)
+    try:                                    # 直连发送端据此结束；中心化服务没有该接口，忽略
+        cli.request("POST", "/api/done", {})
+    except CliError:
+        pass
     return saved
 
 
@@ -473,15 +786,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="landrop.py", description="LAN Drop 命令行：文件码快传")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("send", help="上传一个或多个文件，生成文件码与取件命令")
-    s.add_argument("files", nargs="*", help="文件路径（可用通配符）；省略则交互选择")
-    s.add_argument("--server", default=os.environ.get("LANDROP_URL", DEFAULT_URL),
-                   help=f"服务地址（默认 {DEFAULT_URL}，或环境变量 LANDROP_URL）")
-    s.add_argument("--public-url", help="写进文件码里的对外地址（默认取服务端探测到的局域网地址）")
+    s = sub.add_parser("send", help="直连发送：生成文件码并等待对方 get（无需服务）；--server 则上传到常驻服务")
+    s.add_argument("files", nargs="*", help="文件或目录（可用通配符）；省略则交互选择")
+    s.add_argument("--ip", help="直连模式：写进文件码的本机地址（默认自动探测；多网卡/VPN 时指定）")
+    s.add_argument("--port", type=int, default=0, help="直连模式：监听端口（默认随机）")
+    s.add_argument("--receivers", type=int, default=1, metavar="N", help="直连模式：允许 N 个接收者取完后退出（默认 1）")
+    s.add_argument("--timeout", type=float, default=30, metavar="分钟", help="直连模式：无人取件的等待时长（默认 30）")
+    s.add_argument("--server", default=os.environ.get("LANDROP_URL"),
+                   help="改为上传到常驻服务（地址如 http://192.168.1.5:8000，或环境变量 LANDROP_URL）")
+    s.add_argument("--public-url", help="--server 模式：写进文件码里的对外地址")
     s.add_argument("--key", help="管理员密钥（或环境变量 LANDROP_ADMIN_KEY）")
     s.add_argument("--data-dir", help="数据目录，从中读取 admin-key.txt（默认 ./data，其次平台默认目录）")
     s.add_argument("--expire", type=float, default=24, metavar="小时",
-                   help="文件码有效小时数，0 表示永不过期（默认 24）")
+                   help="--server 模式：文件码有效小时数，0 表示永不过期（默认 24）")
     s.add_argument("--label", help="这批文件的备注（默认用文件名）")
     s.set_defaults(fn=cmd_send)
 
