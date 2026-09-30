@@ -55,6 +55,7 @@ COOKIE_VISITOR = "ld_visitor"
 
 CAPS = {
     "upload": {"list": False, "download": False, "upload": True, "delete": False},
+    "read": {"list": True, "download": True, "upload": False, "delete": False},
     "delete_own": {"list": True, "download": True, "upload": True, "delete": "own"},
     "full": {"list": True, "download": True, "upload": True, "delete": "all"},
     "admin": {"list": True, "download": True, "upload": True, "delete": "all",
@@ -306,6 +307,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.api_grants_revoke()
             if path == "/api/grants/rotate" and method == "POST":
                 return self.api_grants_rotate()
+            if path == "/api/transfers" and method in ("GET", "HEAD"):
+                return self.api_transfers_list()
+            if path == "/api/transfers" and method == "POST":
+                return self.api_transfers_create()
+            if path == "/api/done" and method == "POST":
+                return self.api_done()
             if path == "/api/spaces" and method in ("GET", "HEAD"):
                 return self.api_spaces_list()
             if path == "/api/spaces" and method == "POST":
@@ -994,6 +1001,54 @@ class Handler(BaseHTTPRequestHandler):
         log(f"轮换密钥  <- {self._client_ip()}  {grant_id}")
         self._send_json({"ok": True, "grant": self._grant_public(fresh, secret)})
 
+    # ------------------------------------------------------------ 传输（一次性分享）
+    def api_transfers_create(self):
+        """管理员创建一次传输：临时空间 + 只读令牌。之后用 ?space= 上传文件，取件用令牌登录。"""
+        auth = self._require_admin()
+        if auth is None:
+            return
+        if not self._cs_ok():
+            return self._err(HTTPStatus.FORBIDDEN, "跨站请求被拒绝")
+        data = self._json_body() or {}
+        try:
+            hours = float(data.get("expires_hours", 24) or 0)
+            max_dl = int(data.get("max_downloads", 1) or 0)
+            if hours < 0 or max_dl < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return self._err(HTTPStatus.BAD_REQUEST, "expires_hours / max_downloads 不合法")
+        expires_at = time.time() + hours * 3600 if hours > 0 else None
+        row, secret, space_id = STORE.create_transfer(
+            label=str(data.get("label") or "")[:60], expires_at=expires_at,
+            max_downloads=max_dl or None)
+        log(f"新建传输  <- {self._client_ip()}  {row['id']}  max_downloads={max_dl or '∞'}")
+        self._send_json({"ok": True, "transfer": {
+            "id": row["id"], "space_id": space_id, "secret": secret,
+            "expires_at": expires_at, "max_downloads": max_dl or None}},
+            status=HTTPStatus.CREATED)
+
+    def api_transfers_list(self):
+        auth = self._require_admin()
+        if auth is None:
+            return
+        self._send_json({"ok": True, "transfers": STORE.list_transfers()})
+
+    def api_done(self):
+        """接收端取完全部文件后调用：传输类授权据此累计次数，用完即失效并清理。
+        对普通分享链接与直连发送端的协议保持一致，是无害的空操作。"""
+        auth = self._auth()
+        self._drain_body()
+        if auth is None:
+            return self._err(HTTPStatus.UNAUTHORIZED, "未登录")
+        g = auth["grant"]
+        exhausted = False
+        space = STORE.get_space(g["space_id"]) if g["space_id"] else None
+        if space is not None and space["transient"]:
+            exhausted = STORE.record_download(g["id"])
+            if exhausted:
+                log(f"传输已取完  <- {self._client_ip()}  {g['id']}")
+        self._send_json({"ok": True, "exhausted": exhausted})
+
     def api_spaces_list(self):
         auth = self._require_admin()
         if auth is None:
@@ -1069,6 +1124,22 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+def _start_janitor(interval: float = 60.0):
+    """后台清理：过期会话与失效的一次性传输（连磁盘文件一起删）。"""
+    def loop():
+        while True:
+            time.sleep(interval)
+            try:
+                if STORE is not None:
+                    STORE.purge_expired()
+                    n = STORE.cleanup_transfers()
+                    if n:
+                        log(f"已清理 {n} 个失效传输")
+            except Exception as exc:  # noqa: BLE001
+                log(f"!! 清理任务出错: {exc!r}")
+    threading.Thread(target=loop, daemon=True, name="janitor").start()
+
+
 def prepare(data_dir: str, share_dir: str = "", space_name: str = "共享空间",
             admin_key: str = "", reset_admin: bool = False,
             import_dir: str = "", import_recursive: bool = False,
@@ -1077,6 +1148,8 @@ def prepare(data_dir: str, share_dir: str = "", space_name: str = "共享空间"
     global STORE, DEFAULT_SPACE, PUBLIC_URL
     STORE = Store(data_dir)
     STORE.purge_expired()
+    STORE.cleanup_transfers()
+    _start_janitor()
     exists = STORE.get_meta("default_space")
     if exists and STORE.get_space(exists):
         DEFAULT_SPACE = exists
@@ -1097,6 +1170,9 @@ def prepare(data_dir: str, share_dir: str = "", space_name: str = "共享空间"
         created_key, _ = STORE.init_admin(admin_key or None)
     else:
         STORE.init_admin(None)
+        if STORE.admin_key_file_stale():
+            log("⚠ admin-key.txt 与当前管理员密钥不一致（密钥可能已被轮换）。"
+                "忘记密钥可用 --reset-admin --admin-key <新密钥> 重置。")
 
     import_report = None
     if import_dir:

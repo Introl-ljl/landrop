@@ -405,6 +405,95 @@ def run_checks(port, data_dir):
     check("路径分隔符被剥离", "/" not in sm.safe_stored_name("a/b/c.txt") and
           "\\" not in sm.safe_stored_name("a\\b\\c.txt"))
     check("控制字符被剔除", "\x00" not in sm.safe_stored_name("bad\x00name.txt"))
+
+    print("\n[14] 一次性传输：次数/过期/撤销/清理 与 旧库迁移")
+    st, body, _ = admin.request("POST", "/api/grants", {"kind": "share", "perm": "full",
+                                                          "mode": "token", "label": "t14"}, expect=201)
+    full = Client(port)
+    full.request("POST", "/api/login", {"key": json.loads(body)["grant"]["secret"]}, expect=200)
+    full.request("POST", "/api/transfers", {"label": "x"}, expect=403)
+    anon.request("POST", "/api/transfers", {"label": "x"}, expect=401)
+
+    def make_transfer(**kw):
+        st, body, _ = admin.request("POST", "/api/transfers", kw, expect=201)
+        tr = json.loads(body)["transfer"]
+        data = ("transfer payload " + tr["id"]).encode()
+        admin.request("PUT", f"/api/upload?name=t.bin&id=up{tr['id']}&offset=0&total={len(data)}"
+                      f"&space={tr['space_id']}", data, expect=200)
+        return tr, data
+
+    tr, data = make_transfer(label="两次", expires_hours=1, max_downloads=2)
+    st, body, _ = admin.request("GET", "/api/spaces", expect=200)
+    check("传输的临时空间不出现在空间列表", tr["space_id"] not in [s["id"] for s in json.loads(body)["spaces"]])
+    st, body, _ = admin.request("GET", "/api/grants", expect=200)
+    check("传输授权不出现在授权列表", tr["id"] not in [g["id"] for g in json.loads(body)["grants"]])
+    st, body, _ = admin.request("GET", "/api/transfers", expect=200)
+    check("管理员可列出传输", any(x["id"] == tr["id"] and x["files"] == 1 for x in json.loads(body)["transfers"]))
+
+    rx = Client(port)
+    st, body, _ = rx.request("POST", "/api/login", {"key": tr["secret"]}, expect=200)
+    caps = json.loads(body)["capabilities"]
+    check("传输令牌只读：可下载、不可上传/删除",
+          caps["download"] and not caps["upload"] and caps["delete"] is False)
+    st, body, _ = rx.request("GET", "/api/files", expect=200)
+    files = json.loads(body)["files"]
+    check("传输令牌只看到本批文件", [f["name"] for f in files] == ["t.bin"])
+    st, got, hdrs = rx.request("GET", f"/api/download?id={files[0]['id']}", expect=200)
+    check("传输文件内容与摘要头正确", got == data and hdrs.get("X-File-SHA256") == hashlib.sha256(data).hexdigest())
+    rx.request("PUT", "/api/upload?name=evil&id=evil&offset=0&total=1", b"x", expect=403)
+    check("传输令牌不能删文件", rx.request("DELETE", f"/api/delete?id={files[0]['id']}")[0] == 403)
+    st, body, _ = rx.request("POST", "/api/done", {}, expect=200)
+    check("第 1 次取件后仍可用", json.loads(body)["exhausted"] is False)
+    rx2 = Client(port)
+    rx2.request("POST", "/api/login", {"key": tr["secret"]}, expect=200)
+    st, body, _ = rx2.request("POST", "/api/done", {}, expect=200)
+    check("第 2 次取件后次数用完", json.loads(body)["exhausted"] is True)
+    Client(port).request("POST", "/api/login", {"key": tr["secret"]}, expect=401)
+    rx.request("GET", "/api/files", expect=401)
+    check("用完后已有会话也立即失效", True)
+
+    st, body, _ = make_transfer(label="过期", expires_hours=0.0003, max_downloads=0), None, None
+    short = st[0]
+    time.sleep(1.6)
+    Client(port).request("POST", "/api/login", {"key": short["secret"]}, expect=401)
+
+    rev, _d = make_transfer(label="撤销", expires_hours=1, max_downloads=0)
+    Client(port).request("POST", "/api/login", {"key": rev["secret"]}, expect=200)
+    admin.request("POST", "/api/grants/revoke", {"id": rev["id"]}, expect=200)
+    Client(port).request("POST", "/api/login", {"key": rev["secret"]}, expect=401)
+
+    live, _d = make_transfer(label="保留", expires_hours=1, max_downloads=0)
+    janitor = sm.Store(data_dir)
+    dirs = {t["id"]: janitor.space_dir(t["space_id"]) for t in (tr, short, rev, live)}
+    check("清理前磁盘上有文件", all(os.path.isdir(d) for d in dirs.values()))
+    removed = janitor.cleanup_transfers()
+    check("清理 3 个失效传输（取完/过期/撤销）", removed == 3, str(removed))
+    check("失效传输的磁盘文件已删除",
+          not any(os.path.exists(dirs[t["id"]]) for t in (tr, short, rev)))
+    check("仍有效的传输不受影响", os.path.isdir(dirs[live["id"]]) and
+          [x["id"] for x in janitor.list_transfers()] == [live["id"]])
+    Client(port).request("POST", "/api/login", {"key": live["secret"]}, expect=200)
+    janitor.close()
+
+    # 旧版数据库（没有新增列）必须能原样打开并迁移
+    import sqlite3
+    old_dir = os.path.join(tempfile.mkdtemp(prefix="landrop-old-"), "data")
+    os.makedirs(old_dir)
+    conn = sqlite3.connect(os.path.join(old_dir, "state.sqlite3"))
+    conn.executescript(sm._SCHEMA)
+    conn.execute("INSERT INTO spaces(id,name,dir,created_at) VALUES('sp_old','旧空间','old',1)")
+    conn.execute("INSERT INTO grants(id,kind,space_id,perm,mode,token_hash,created_at) "
+                 "VALUES('gs_old','share','sp_old','full','token','h',1)")
+    conn.commit()
+    conn.close()
+    migrated = sm.Store(old_dir)
+    g = migrated.get_grant("gs_old")
+    check("旧库迁移：数据保留且新增列有默认值",
+          g is not None and g["downloads"] == 0 and g["max_downloads"] is None
+          and [s["id"] for s in migrated.list_spaces()] == ["sp_old"])
+    migrated.close()
+    sm.Store(old_dir).close()      # 再开一次：迁移幂等
+    check("迁移可重复执行", True)
     check("空文件名有兜底", sm.safe_stored_name("") == "unnamed")
     long_name = "字" * 300 + ".txt"
     check("超长文件名被截断", len(sm.safe_stored_name(long_name).encode("utf-8")) <= 240,

@@ -29,7 +29,7 @@ import unicodedata
 PBKDF2_ROUNDS = 120_000            # 人类口令的派生轮数
 SESSION_TTL = 7 * 86400            # 会话有效期（秒）
 VISITOR_TTL = 400 * 86400          # 访客 Cookie 有效期（秒）
-VALID_PERMS = ("upload", "delete_own", "full")
+VALID_PERMS = ("upload", "read", "delete_own", "full")
 VALID_MODES = ("token", "password")
 HASH_CHUNK = 1024 * 1024
 
@@ -188,6 +188,20 @@ class Store:
         self._write_lock = threading.RLock()
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            self._migrate(c)
+
+    @staticmethod
+    def _migrate(c):
+        """只增不改的迁移：旧数据目录原样可用（新增列带默认值）。"""
+        def cols(table):
+            return {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+        if "transient" not in cols("spaces"):
+            c.execute("ALTER TABLE spaces ADD COLUMN transient INTEGER NOT NULL DEFAULT 0")
+        grant_cols = cols("grants")
+        if "max_downloads" not in grant_cols:
+            c.execute("ALTER TABLE grants ADD COLUMN max_downloads INTEGER")
+        if "downloads" not in grant_cols:
+            c.execute("ALTER TABLE grants ADD COLUMN downloads INTEGER NOT NULL DEFAULT 0")
 
     # ---------------------------------------------------------------- 连接
     def _conn(self) -> sqlite3.Connection:
@@ -231,8 +245,11 @@ class Store:
         )
 
     # ---------------------------------------------------------------- 空间
-    def list_spaces(self):
-        return self._query("SELECT * FROM spaces ORDER BY created_at")
+    def list_spaces(self, include_transient: bool = False):
+        """默认不含「传输」产生的临时空间，管理面板与空间列表里看不到它们。"""
+        if include_transient:
+            return self._query("SELECT * FROM spaces ORDER BY created_at")
+        return self._query("SELECT * FROM spaces WHERE transient=0 ORDER BY created_at")
 
     def get_space(self, space_id: str):
         return self._one("SELECT * FROM spaces WHERE id=?", (space_id,))
@@ -298,13 +315,73 @@ class Store:
         )
         return self.get_grant(gid), secret
 
+    # ---------------------------------------------------------------- 传输（一次性分享批次）
+    def create_transfer(self, label: str = "", expires_at: float | None = None,
+                        max_downloads: int | None = 1):
+        """临时空间 + 只读授权：到期/用完/撤销后由 cleanup_transfers 连文件一起清理。
+        返回 (grant_row, 明文令牌, space_id)。"""
+        sid = self.create_space("transfer-" + secrets.token_hex(3))
+        self._write("UPDATE spaces SET transient=1 WHERE id=?", (sid,))
+        row, secret = self.create_grant(kind="share", space_id=sid, perm="read", mode="token",
+                                        label=label, expires_at=expires_at)
+        if max_downloads:
+            self._write("UPDATE grants SET max_downloads=? WHERE id=?", (int(max_downloads), row["id"]))
+        return self.get_grant(row["id"]), secret, sid
+
+    def record_download(self, grant_id: str) -> bool:
+        """登记一次「完整取件」；返回是否已用完次数。"""
+        with self._write_lock:
+            self._write("UPDATE grants SET downloads=downloads+1 WHERE id=?", (grant_id,))
+            g = self.get_grant(grant_id)
+        return bool(g and g["max_downloads"] is not None and g["downloads"] >= g["max_downloads"])
+
+    def list_transfers(self):
+        rows = self._query(
+            "SELECT g.*, s.id AS sid FROM grants g JOIN spaces s ON s.id=g.space_id "
+            "WHERE s.transient=1 ORDER BY g.created_at DESC")
+        out = []
+        for g in rows:
+            files = self._query(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS b FROM files "
+                "WHERE space_id=? AND status='active'", (g["sid"],))[0]
+            out.append({"id": g["id"], "space_id": g["sid"], "label": g["label"],
+                        "created_at": g["created_at"], "expires_at": g["expires_at"],
+                        "downloads": g["downloads"], "max_downloads": g["max_downloads"],
+                        "revoked": bool(g["revoked"]), "files": files["n"], "bytes": files["b"],
+                        "usable": self.grant_state(g["id"])[0]})
+        return out
+
+    def cleanup_transfers(self) -> int:
+        """删除已失效的传输（过期/撤销/次数用完）及其磁盘文件；返回清理数量。"""
+        removed = 0
+        for g in self._query(
+                "SELECT g.id AS gid, s.id AS sid FROM grants g JOIN spaces s ON s.id=g.space_id "
+                "WHERE s.transient=1"):
+            if self.grant_state(g["gid"])[0]:
+                continue
+            try:
+                shutil.rmtree(self.space_dir(g["sid"]), ignore_errors=True)
+            except KeyError:
+                pass
+            self._write("DELETE FROM spaces WHERE id=?", (g["sid"],))   # 级联清理授权/文件/会话/上传
+            removed += 1
+        # 只有空间、没有授权的残留（创建过程中崩溃）
+        for sp in self._query(
+                "SELECT id FROM spaces WHERE transient=1 AND created_at<? AND "
+                "NOT EXISTS (SELECT 1 FROM grants WHERE space_id=spaces.id)", (now() - 3600,)):
+            shutil.rmtree(self.space_dir(sp["id"]), ignore_errors=True)
+            self._write("DELETE FROM spaces WHERE id=?", (sp["id"],))
+            removed += 1
+        return removed
+
     def get_grant(self, grant_id: str):
         return self._one("SELECT * FROM grants WHERE id=?", (grant_id,))
 
     def list_grants(self):
         return self._query(
             "SELECT g.*, s.name AS space_name FROM grants g "
-            "LEFT JOIN spaces s ON s.id=g.space_id ORDER BY g.created_at"
+            "LEFT JOIN spaces s ON s.id=g.space_id WHERE COALESCE(s.transient,0)=0 "
+            "ORDER BY g.created_at"
         )
 
     def find_login_grant(self, secret: str):
@@ -332,6 +409,8 @@ class Store:
             return False, "授权已撤销"
         if g["expires_at"] and g["expires_at"] < now():
             return False, "授权已过期"
+        if g["max_downloads"] is not None and g["downloads"] >= g["max_downloads"]:
+            return False, "下载次数已用完"
         return True, ""
 
     def touch_grant(self, grant_id: str):
@@ -359,7 +438,20 @@ class Store:
                 "UPDATE grants SET token_hash=?, version=version+1 WHERE id=?",
                 (token_hash(secret), grant_id),
             )
+        g = self.get_grant(grant_id)
+        if g is not None and g["kind"] == "admin":      # 保持 admin-key.txt 与当前密钥一致
+            self._write_admin_key_file(secret)
         return secret
+
+    def admin_key_file_stale(self) -> bool:
+        """admin-key.txt 存在但与当前管理员密钥不匹配（例如旧版轮换后没有更新文件）。"""
+        g = self.admin_grant()
+        try:
+            with open(self.admin_key_file(), "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except OSError:
+            return False
+        return bool(g and content and token_hash(content) != (g["token_hash"] or ""))
 
     # ---------------------------------------------------------------- 访客
     def create_visitor(self) -> tuple[str, str]:
@@ -405,7 +497,7 @@ class Store:
             self._write("DELETE FROM sessions WHERE token_hash=?", (row["token_hash"],))
             return None
         g = self.get_grant(row["grant_id"])
-        if g is None or g["revoked"] or (g["expires_at"] and g["expires_at"] < now()):
+        if g is None or not self.grant_state(g["id"])[0]:
             return None
         if g["version"] != row["grant_version"]:
             return None

@@ -69,6 +69,7 @@ tr:last-child td{border-bottom:none}
   background:var(--surface-2); border:1px solid var(--line); color:var(--text-2);
 }
 .pill.perm-upload{background:var(--accent-soft); border-color:var(--accent); color:var(--accent-text)}
+.pill.perm-read{background:var(--accent-soft); border-color:var(--accent); color:var(--accent-text)}
 .pill.perm-delete_own{background:var(--warn-soft); border-color:var(--warn); color:var(--warn)}
 .pill.perm-full{background:var(--danger-soft); border-color:var(--danger); color:var(--danger)}
 .pill.off{opacity:.6; text-decoration:line-through}
@@ -130,6 +131,7 @@ tr:last-child td{border-bottom:none}
       <div><label for="gPerm">权限</label>
         <select id="gPerm">
           <option value="upload">仅上传（看不到已有文件）</option>
+          <option value="read">仅下载（可读，不能上传/删除）</option>
           <option value="delete_own" selected>上传 + 可读，只能删自己的</option>
           <option value="full">完整读写（可删全部）</option>
         </select></div>
@@ -199,7 +201,7 @@ $("#themeBtn").addEventListener("click", () => {
 });
 
 const PERM_TEXT = {
-  upload: "仅上传", delete_own: "可读 · 只删自己的", full: "完整读写",
+  upload: "仅上传", read: "仅下载", delete_own: "可读 · 只删自己的", full: "完整读写",
 };
 const MODE_TEXT = { token: "链接密钥", password: "口令" };
 

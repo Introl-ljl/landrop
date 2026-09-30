@@ -148,7 +148,7 @@ def main():
         paths = [os.path.join(src, n) for n in files]
 
         rc, out, _ = run(["send", *paths, "--server", server, "--key", KEY, "--expire", "1",
-                          "--public-url", server])
+                          "--max-downloads", "0", "--public-url", server])
         check(rc == 0, "send 成功")
         m = re.search(r"文件码:\s+(\S+)", out)
         code = m.group(1) if m else ""
@@ -179,6 +179,15 @@ def main():
         check(rc == 0, "revoke 成功")
         rc, _, err = run(["get", code, "-o", dest])
         check(rc == 1, "撤销后取件失败")
+        one = os.path.join(src, "a.bin")
+        rc, out, _ = run(["send", one, "--server", server, "--key", KEY, "--public-url", server])
+        code1 = re.search(r"文件码:\s+(\S+)", out).group(1)
+        d1 = os.path.join(tmp, "once")
+        rc, _, _ = run(["get", code1, "-o", d1])
+        check(rc == 0 and os.path.isfile(os.path.join(d1, "a.bin")), "经服务的传输默认一次性：首次取件成功")
+        rc, _, _ = run(["get", code1, "-o", d1])
+        check(rc == 1, "经服务的传输：取完一次后文件码失效")
+
         direct_checks(tmp)
     finally:
         proc.terminate()

@@ -275,30 +275,31 @@ def upload_file(cli: Client, space_id: str, path: str, on_progress=progress):
 
 
 def send_files(server: str, key: str, paths: list[str], expire_hours: float = 24,
-               label: str = "", public_url: str = "", on_progress=progress) -> dict:
-    """上传文件并签发取件授权。返回 {code, grant_id, count, bytes, expire_hours, command}。
+               label: str = "", public_url: str = "", on_progress=progress,
+               max_downloads: int = 1) -> dict:
+    """经常驻服务的一次性传输：建传输 → 上传 → 给出文件码。返回 {code, grant_id, ...}。
 
-    命令行与图形界面共用；进度通过回调交出，调用方决定怎么显示。
+    传输到期 / 取够次数 / 被撤销后，服务端会自动连文件一起清理，不会留下空间与授权。
     """
     cli = Client(server)
     cli.login(key)
     label = (label or ", ".join(os.path.basename(p) for p in paths))[:60]
-    space = cli.request("POST", "/api/spaces", {"name": f"传输 {time.strftime('%m-%d %H:%M:%S')}"})
-    space_id = space["space"]["id"]
-    for p in paths:
-        upload_file(cli, space_id, p, on_progress)
-    created = cli.request("POST", "/api/grants", {
-        "kind": "share", "space_id": space_id, "perm": "delete_own", "mode": "token",
-        "label": label, "expires_days": (expire_hours / 24) if expire_hours else 0})
-    grant = created["grant"]
-    token = grant.get("secret") or ""
-    if not token:
-        raise CliError("服务端没有返回令牌（grant 响应里无 secret）")
-    code = make_code(normalize_base(public_url or _public_url(cli) or cli.base), token)
+    tr = cli.request("POST", "/api/transfers", {
+        "label": label, "expires_hours": expire_hours, "max_downloads": max_downloads})["transfer"]
+    try:
+        for p in paths:
+            upload_file(cli, tr["space_id"], p, on_progress)
+    except BaseException:
+        try:                                    # 半途失败：撤销，交给服务端清理
+            cli.request("POST", "/api/grants/revoke", {"id": tr["id"]})
+        except CliError:
+            pass
+        raise
+    code = make_code(normalize_base(public_url or _public_url(cli) or cli.base), tr["secret"])
     return {
-        "code": code, "grant_id": grant["id"], "count": len(paths),
+        "code": code, "grant_id": tr["id"], "count": len(paths),
         "bytes": sum(os.path.getsize(p) for p in paths), "expire_hours": expire_hours,
-        "command": f"{cmd_prefix()} get {code}",
+        "max_downloads": max_downloads, "command": f"{cmd_prefix()} get {code}",
     }
 
 
@@ -318,7 +319,7 @@ def cmd_send_via_server(args) -> int:
 
     try:
         res = send_files(args.server, find_admin_key(args), paths, args.expire, args.label,
-                         args.public_url or "", show)
+                         args.public_url or "", show, args.max_downloads)
     except KeyboardInterrupt:
         print("\n发送中断，传输空间里可能残留已上传的文件", file=sys.stderr)
         return 130
@@ -328,8 +329,9 @@ def cmd_send_via_server(args) -> int:
     print(f"取件命令: {res['command']}")
     print("          （加 -o <目录> 指定保存位置，默认保存到运行命令时所在目录）")
     exp = f"{args.expire:g} 小时后过期" if args.expire else "永不过期"
-    print(f"共 {res['count']} 个文件，{human(res['bytes'])}，{exp}；"
-          f"撤销：{cmd_prefix()} revoke {res['grant_id']}")
+    times = f"可取 {args.max_downloads} 次" if args.max_downloads else "取件次数不限"
+    print(f"共 {res['count']} 个文件，{human(res['bytes'])}，{exp}，{times}；"
+          f"到期/取完后服务端自动清理；撤销：{cmd_prefix()} revoke {res['grant_id']}")
     return 0
 
 
@@ -799,6 +801,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--data-dir", help="数据目录，从中读取 admin-key.txt（默认 ./data，其次平台默认目录）")
     s.add_argument("--expire", type=float, default=24, metavar="小时",
                    help="--server 模式：文件码有效小时数，0 表示永不过期（默认 24）")
+    s.add_argument("--max-downloads", type=int, default=1, metavar="N",
+                   help="--server 模式：最多被完整取件几次，0 表示不限（默认 1，即一次性）")
     s.add_argument("--label", help="这批文件的备注（默认用文件名）")
     s.set_defaults(fn=cmd_send)
 
