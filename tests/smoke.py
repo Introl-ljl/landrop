@@ -20,6 +20,12 @@ import sys
 import tempfile
 import time
 
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
@@ -101,6 +107,7 @@ def main():
          "--data-dir", data_dir, "--host", "127.0.0.1", "--port", str(port),
          "--admin-key", "admin-secret-123"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        encoding="utf-8", errors="replace",
     )
     try:
         if not wait_port(port):

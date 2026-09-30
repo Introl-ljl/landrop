@@ -1142,7 +1142,17 @@ def banner(info: dict):
     print(line, flush=True)
 
 
+def _force_utf8_output():
+    """Windows 管道/旧代码页下 print 中文会抛 UnicodeEncodeError：统一成 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main(argv=None):
+    _force_utf8_output()
     args = parse_args(argv)
     info = prepare(
         data_dir=args.data_dir, share_dir=args.dir, space_name=args.space,
