@@ -16,6 +16,9 @@ import sys
 import tempfile
 import time
 
+import faulthandler
+faulthandler.dump_traceback_later(240, exit=True)   # 卡死时打印各线程堆栈并退出，便于 CI 定位
+
 for _s in (sys.stdout, sys.stderr):
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")

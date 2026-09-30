@@ -12,6 +12,7 @@ jobs:
   test:
     name: test (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -26,9 +27,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Server smoke tests
-        run: python tests/smoke.py
+        run: python -u tests/smoke.py
       - name: CLI end-to-end tests
-        run: python tests/cli_check.py
+        run: python -u tests/cli_check.py
 
   package:
     name: build check (${{ matrix.os }})
