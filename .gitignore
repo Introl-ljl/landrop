@@ -1,0 +1,28 @@
+# 运行时数据（状态库、文件、分块、回收站）不纳入版本控制
+data/
+uploads/
+
+# 打包产物
+dist/
+build/
+*.manifest
+
+# Python
+__pycache__/
+*.pyc
+
+# 密钥/环境
+.env
+.env.*
+!.env.example
+admin-key.txt
+
+# 系统
+.DS_Store
+
+# 构建好的二进制（由 pyinstaller 生成，不入库）
+static/downloads/landrop-cli-*
+static/downloads/*.exe
+
+# 本地工具
+.claude/

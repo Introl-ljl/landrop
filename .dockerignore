@@ -1,0 +1,14 @@
+uploads/
+data/
+dist/
+build/
+*.pyc
+__pycache__/
+.env
+.git/
+.gitignore
+Dockerfile
+docker-compose.yml
+README.md
+tests/
+landrop.spec
