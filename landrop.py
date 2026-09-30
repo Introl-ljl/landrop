@@ -352,7 +352,7 @@ _WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
 
 def safe_local_name(name: str) -> str:
     """服务端给的名字不可信：去路径、去 Windows 非法字符/保留名，三个平台都能落盘。"""
-    name = os.path.basename(name.replace("\\", "/"))
+    name = name.replace("\\", "/").split("/")[-1]   # 不用 os.path.basename：Windows 上会把 "a:b" 当盘符
     name = "".join(ch for ch in name if ch >= " " and ch != "\x7f")
     name = re.sub(r'[<>:"/\\|?*]', "_", name).strip().rstrip(". ")
     if not name:
