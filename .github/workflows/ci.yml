@@ -30,6 +30,14 @@ jobs:
         run: python -u tests/smoke.py
       - name: CLI end-to-end tests
         run: python -u tests/cli_check.py
+      - name: GUI end-to-end tests (Linux, virtual display)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+          xvfb-run -a python -u tests/gui_check.py
+      - name: GUI end-to-end tests
+        if: runner.os != 'Linux'
+        run: python -u tests/gui_check.py
 
   package:
     name: build check (${{ matrix.os }})

@@ -54,7 +54,7 @@ class LauncherApp:
         self.filedialog = filedialog
 
         self.root = tk.Tk()
-        self.root.title("LAN Drop · 局域网文件收集与分享")
+        self.root.title("LAN Drop · 局域网文件互传与收集")
         self.root.minsize(680, 520)
         self.httpd = None
         self.thread = None
@@ -65,7 +65,7 @@ class LauncherApp:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True)
         main = ttk.Frame(self.notebook, padding=14)
-        self.notebook.add(main, text="服务")
+        self.notebook.add(main, text="收集服务")
         main.columnconfigure(1, weight=1)
         row = 0
 
@@ -131,10 +131,14 @@ class LauncherApp:
             self.root, self.notebook,
             default_url=f"http://127.0.0.1:{self.port_var.get().strip() or '8000'}")
 
+        # 标签顺序：发送 / 接收（直连，主要功能）在前，收集服务在后
+        self.notebook.insert("end", main)
+        self.notebook.select(self.share.send_tab)
+
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.write("准备就绪。点击「启动服务」开始。\n")
         self.write("提示：首次启动会生成管理员密钥，用它在管理面板里创建分享链接。\n")
-        self.write("要快速传文件：启动服务后切到「发送文件」页，选文件即可生成文件码。\n")
+        self.write("只想把文件发给另一台电脑：用「发送文件」页，不需要启动这里的服务。\n")
 
     # ---------------------------------------------------------------- 目录
     def pick_share(self):
@@ -292,6 +296,7 @@ class LauncherApp:
                                                      "已上传的文件与链接都会保留。确定退出？"):
                 return
             self.stop()
+        self.share.shutdown()
         self.root.destroy()
 
     def run(self):
