@@ -1,165 +1,121 @@
-# LAN Drop · 局域网文件收集与快捷分享
+# LAN Drop · 局域网文件互传与收集
 
 [![CI](https://github.com/Introl-ljl/landrop/actions/workflows/ci.yml/badge.svg)](https://github.com/Introl-ljl/landrop/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Zero dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen)
 
-**English summary** — A zero-dependency (Python stdlib) LAN file collector/sharer. Run the server on one
-machine; others upload/download from a browser with per-link permissions (upload-only / read + delete-own /
-full), SHA-256 verification and resumable uploads. Quick transfer with a **file code**:
-`landrop.py send a.zip` prints a code + a command, the receiver runs `landrop.py get <code>`.
-Windows/macOS get a GUI launcher, Linux gets the CLI, Docker is supported. MIT licensed.
+**English summary** — Zero-dependency (Python stdlib) LAN file tool with three ways to use it:
+**(1)** direct peer-to-peer transfer with a file code — `landrop send a.zip` prints a code, the receiver runs
+`landrop get <code>`; no server needed; **(2)** `landrop serve` turns your machine into a collection server
+(web UI + CLI, per-link permissions, SHA-256 verification, resumable uploads); **(3)** run that server long-term
+(Docker) and use it as a central hub with one-shot, auto-expiring transfers. GUI for Windows/macOS, CLI for Linux. MIT.
 
-## 下载 / Download
+## 你想做什么？
 
-到 [Releases](https://github.com/Introl-ljl/landrop/releases) 下载对应平台的产物（含 `SHA256SUMS`）：
+| 场景 | 用法 | 一句话 |
+| --- | --- | --- |
+| 把文件发给**另一台电脑**，用完即走 | [① 直连文件码](#-直连文件码互传去中心化) | `landrop send a.zip` → 对方 `landrop get <文件码>`，不需要服务 |
+| 让**一群人**往我电脑上传文件（浏览器即可） | [② 收集服务](#-收集服务landrop-serve) | `landrop serve`，把链接发给大家 |
+| 常驻一台机器做**中心化**中转/收集 | [③ 常驻服务](#-常驻服务docker--中心化传输) | Docker 跑服务，`landrop send --server …` 生成一次性取件码 |
+
+## 下载 / 安装
+
+到 [Releases](https://github.com/Introl-ljl/landrop/releases) 下载（含 `SHA256SUMS`）：
 
 | 平台 | 文件 |
 | --- | --- |
-| Windows | `landrop-windows-x86_64.exe`（GUI）、`landrop-cli-windows-x86_64.exe`、`landrop-server-windows-x86_64.exe` |
-| macOS (Apple Silicon / Intel) | `landrop-macos-arm64` / `landrop-macos-x86_64`（GUI），以及同名系列的 `-cli-`、`-server-` |
-| Linux (x86_64 / arm64) | `landrop-cli-linux-*`、`landrop-server-linux-*`（Linux 只提供命令行） |
+| Windows x64 | `landrop-gui-windows-x86_64.exe`（窗口）、`landrop-windows-x86_64.exe`（命令行） |
+| macOS（Apple 芯片 / Intel） | `landrop-gui-macos-arm64` / `landrop-gui-macos-x86_64`（窗口）、`landrop-macos-*`（命令行） |
+| Linux x64 / arm64 | `landrop-linux-*`（命令行，含 `serve`；Linux 只提供命令行） |
+| 任意装了 Python 3.8+ 的系统 | `landrop.pyz`（单文件，`python3 landrop.pyz send …`） |
 | Docker | `docker pull ghcr.io/introl-ljl/landrop:latest` |
-| 任意有 Python 的系统 | 只下载 `landrop.py`（客户端，单文件） |
+| 从源码 | `git clone … && python3 -m landrop --help`，或 `pip install .` 得到 `landrop` 命令 |
 
 > macOS 二进制未签名：首次运行请在「系统设置 → 隐私与安全性」允许，或 `xattr -d com.apple.quarantine <文件>`。
-> Windows 可能出现 SmartScreen 提示，选择「仍要运行」。
-
-在一台电脑上启动，同一局域网内的手机与电脑用浏览器打开链接即可**投递文件、取件、按权限删除**。
-文件全部落在本机（或你指定的磁盘目录），链接可随时撤销，上传完成会给出一份
-**服务端实算的 SHA-256 校验值**。
-
-它解决的场景是"**一次活动、一组人、一批文件**"：
-
-- 让 20 个人把照片传到你的电脑上，但不让他们看到彼此的文件（仅上传链接）；
-- 让自己的设备之间互传，还能删掉自己传错的（可读 + 只删自己的）；
-- 给协作者一条完整读写链接，能整理所有人的文件；
-- 任何一次投递都能拿到摘要，核对"最终收到的文件"和"发送出去的文件"是否一致。
-
-- 🔑 **多链接独立授权**：每条链接有自己的权限、有效期与空间，可单独撤销、轮换。
-- 🧑🤝🧑 **三档权限**：仅上传 / 可读·只删自己的 / 完整读写；权限由服务端强制，不只是隐藏按钮。
-- 🗂️ **多空间隔离**：每个空间是独立目录 + 独立链接集合，互不可见；存储位置可指定。
-- 🔐 **SHA-256 校验**：分块齐全后由服务端从**最终文件**重算摘要并登记；浏览器能算摘要时会自动比对。
-- 📦 **任意文件与断点续传**：流式上传、8 MiB 分块、失败续传、下载支持 Range。
-- 🖥️ **三种形态**：Docker Compose / 单文件可执行包 / 桌面启动器（Windows、macOS、Linux）。
-- 🪶 **零第三方运行依赖**：服务端与桌面启动器都只用 Python 标准库（SQLite + http.server + tkinter）。
+> Windows 可能出现 SmartScreen 提示，选择「仍要运行」。下文命令里的 `landrop` 在不同形态下等价于
+> `python3 -m landrop`（源码）、`python3 landrop.pyz`（pyz）或二进制文件名。
 
 ---
 
-## 快速开始
+## ① 直连文件码互传（去中心化）
 
-### 方式一：直接运行（需要 Python 3.8+，已在 3.8 / 3.10 / 3.12 实测）
+发送端在本机临时监听一个端口，把「地址 + 令牌」编进**文件码**；接收端用文件码直接向发送端取件。
+**没有服务器、没有账号**，取完（或超时 / Ctrl-C）发送端自动退出，文件码随即失效。
 
 ```bash
-python3 server.py --data-dir ./data
+# 发送端
+landrop send a.zip b.png photos/        # 多个文件、整个文件夹都行，可用通配符
+landrop send                            # 不带参数：列出当前目录按编号多选
+# 输出：
+#   文件码:  192.168.1.5:41234/Xk3…
+#   取件命令: landrop get 192.168.1.5:41234/Xk3…
+#   等待接收端连接… 一次性，30 分钟内无人取件将自动退出；Ctrl-C 取消。
+
+# 接收端（直接复制上面的命令）
+landrop get 192.168.1.5:41234/Xk3…                # 保存到当前目录
+landrop get <文件码> -o ~/Downloads               # 指定目录（不存在会创建）
+landrop get <文件码> --list                       # 只看有哪些文件
+landrop get <文件码> --only a.zip -f              # 只取某个文件；同名覆盖（默认自动改名）
 ```
 
-启动后终端会打印访问地址、管理员密钥与共享目录。用管理员密钥进入 `/admin` 创建分享链接：
-把链接发给同事，他们打开就能上传；你可以随时撤销或轮换这条链接。
+- **校验与续传**：发送端先算 SHA-256，接收端逐个校验，失败不落盘；下载中断后重新运行 `get` 会从 `.part` 断点继续。
+- **文件夹**：保留目录结构；接收端逐段清洗路径，拒绝 `..`。
+- **选项**：`--receivers N`（允许 N 个接收者取完后退出）、`--timeout 分钟`、`--port`、`--ip`（多网卡/VPN 时指定写进文件码的地址）。
+- **Windows / macOS 图形界面**：打开 `landrop-gui`（或 `landrop gui`）→「发送文件」页添加文件/文件夹 → 生成文件码并一键复制；
+  对方在「接收文件」页粘贴文件码（整条命令也行）即可。发送期间保持窗口打开。
+- **注意**：传输是明文 HTTP，仅限可信局域网；首次监听系统防火墙会弹窗，请选「允许访问」。
 
-自定义存储位置（收集到活动硬盘）：
+---
+
+## ② 收集服务（`landrop serve`）
+
+在本机启动服务，同一局域网的手机与电脑用浏览器打开链接即可**投递文件、取件、按权限删除**。
+适合「一次活动、一组人、一批文件」：
+
+- 让 20 个人把照片传到你的电脑上，但互相看不到彼此的文件（仅上传链接）；
+- 自己的设备之间互传，还能删掉传错的；
+- 给协作者一条完整读写链接，整理所有人的文件；
+- 每次投递都拿到服务端实算的 SHA-256 回执，核对「收到的」与「发出的」是否一致。
 
 ```bash
-python3 server.py --data-dir ./data --dir /mnt/disk/毕业照 --space 毕业照
+landrop serve --data-dir ./data                       # 启动，终端打印访问地址与管理员密钥
+landrop serve --data-dir ./data --dir /mnt/disk/毕业照 --space 毕业照   # 收集到指定磁盘目录
+landrop serve --data-dir ./data --import ./uploads --import-recursive  # 导入历史文件（复制+校验）
+landrop gui                                           # Windows/macOS：窗口里点「收集服务」→ 启动
 ```
 
-导入已有目录里的历史文件（复制 + 逐文件校验，原目录保持不动）：
+用管理员密钥打开 `/admin` 创建分享链接，把链接发给大家；可随时撤销或轮换。
+
+**同样支持命令行操作**（网页能做的核心动作 CLI 都能做）：
 
 ```bash
-python3 server.py --data-dir ./data --import ./uploads --import-recursive
+landrop send a.zip --server http://192.168.1.5:8000 --key <管理员密钥>   # 上传并生成一次性取件码
+landrop get  <文件码> -o ./out                                          # 用取件码取件
+landrop revoke <授权ID> --server … --key …                              # 撤销
 ```
 
-### 方式二：桌面启动器（Windows / macOS / Linux）
+`--key` 也可用环境变量 `LANDROP_ADMIN_KEY`；本机运行时会自动读取 `--data-dir` 里的 `admin-key.txt`。
+
+---
+
+## ③ 常驻服务（Docker / 中心化传输）
+
+把同一个服务长期跑在一台机器上，作为团队的中转站：大家都往它上传 / 从它取件，发送端不必一直在线。
 
 ```bash
-python3 desktop.py                 # 打开窗口，点「启动服务」
-python3 desktop.py --autostart     # 打开窗口并立即启动（适合开机自启）
-python3 desktop.py --no-window     # 不开窗口，只按环境变量启动服务
-```
-
-窗口配置也可用环境变量预填：`LANDROP_DATA_DIR`、`LANDROP_SHARE_DIR`、
-`LANDROP_PORT`、`LANDROP_SCOPE`（`lan` 或 `local`）。
-
-窗口里选择共享目录与数据目录、选择「局域网 / 仅本机」、点「启动服务」。
-之后用「打开管理面板」创建链接，其余操作都在浏览器里完成。局域网内其他人**不需要安装任何东西**。
-
-### 方式三：单文件分发包
-
-在**目标操作系统**上执行（不能跨平台交叉编译）：
-
-```bash
-pip install pyinstaller
-pyinstaller --clean --noconfirm landrop.spec
-```
-
-产物：
-
-| 文件 | 说明 |
-| --- | --- |
-| `dist/landrop` | 桌面启动器 GUI（服务 / 发送 / 接收），**仅 Windows 与 macOS 生成** |
-| `dist/landrop-cli` | 命令行：`send` / `get` / `revoke` / `serve`，所有平台 |
-| `dist/landrop-server` | 命令行服务器，参数与 `server.py` 相同，所有平台 |
-
-### 方式四：Docker Compose（常态化运行）
-
-```bash
-cp .env.example .env        # 设置 LANDROP_ADMIN_KEY、端口、PUID/PGID
+cp .env.example .env        # 设置 LANDROP_ADMIN_KEY、端口、PUID/PGID、LANDROP_PUBLIC_URL
 chown -R $(id -u):$(id -g) data
 docker compose up -d --build
 docker compose logs | grep -E "访问地址|管理员密钥"
 ```
 
-> 升级提示：v2 的数据、链接与权限都持久化在数据卷里。旧版只有 `uploads/` 一个目录，
-> 请用 `--import ./uploads` 导入，**不要**直接删除旧目录。
-
----
-
-## 文件码快传（Windows / macOS 用 GUI，Linux 用 CLI）
-
-| 平台 | 形态 | 入口 |
-| --- | --- | --- |
-| Windows / macOS | 图形界面 | `python3 desktop.py`（或打包产物 `landrop`）→「发送文件」「接收文件」页 |
-| Linux | 命令行 | `python3 landrop.py …`（或打包产物 `landrop-cli`） |
-
-**图形界面**：先在「服务」页启动服务（发送页会自动填好地址与密钥）→「发送文件」页点「添加文件…」多选 →
-「上传并生成文件码」→ 一键复制文件码 / 取件命令；对方在「接收文件」页粘贴文件码（整条命令也行）、
-选保存目录、点「下载」。也可随时「撤销这个文件码」。
-
-**命令行**（三个平台都能用，接收端只需拷走 `landrop.py`）：
-
-不想开浏览器时，用命令行把一个或多个文件变成**文件码 + 取件命令**。仅需 Python 3.8+ 标准库，
-接收端只要拷走 `landrop.py` 这一个文件。
-
-```bash
-# 发送端（服务所在机器；自动从 ./data/admin-key.txt 读管理员密钥）
-python3 landrop.py send a.zip b.png "*.log"        # 一个或多个文件，支持通配符
-python3 landrop.py send                            # 不带参数：列出当前目录，按编号多选
-python3 landrop.py send a.zip --expire 2           # 文件码 2 小时后失效（0 = 永不过期，默认 24）
-# 输出：
-#   文件码:  192.168.1.5:8000/AbC…
-#   取件命令: python3 landrop.py get 192.168.1.5:8000/AbC…
-
-# 接收端：直接复制上面的命令
-python3 landrop.py get 192.168.1.5:8000/AbC…                # 下载到当前目录
-python3 landrop.py get 192.168.1.5:8000/AbC… -o ~/Downloads  # 指定目录（不存在会创建）
-python3 landrop.py get <文件码> --list                       # 只看有哪些文件
-python3 landrop.py get <文件码> --only a.zip -f              # 只取某个文件；同名覆盖（默认自动改名）
-
-# 提前撤销（send 结束时会打印授权 ID）
-python3 landrop.py revoke gs_xxxxxxxxxxxx
-
-# Linux 直接启动服务（参数同 server.py）
-python3 landrop.py serve --data-dir ./data
-```
-
-- 每次 `send` 会新建一个**独立空间**和一条**取件授权**（`可读 · 只删自己的`），文件码只能看到这一批文件。
-- 上传按 8 MiB 分块并携带本地 SHA-256，服务端不一致会拒收；下载时用服务端摘要逐个校验，失败的文件不落盘。
-- 发送端参数：`--server`（默认 `http://127.0.0.1:8000`，或 `LANDROP_URL`）、`--key` / `LANDROP_ADMIN_KEY`、
-  `--data-dir`、`--public-url`（写入文件码的对外地址，默认取服务端探测到的局域网地址）、`--label`。
-- Docker 部署：服务跑在容器里，CLI 在宿主机/其他电脑上用 `--server http://<宿主机IP>:<端口>`；镜像已内置 `landrop.py`，并在 `http://<地址>/downloads/landrop.py` 提供下载；构建好的 Linux 二进制放进 `static/downloads/` 后重新 `docker compose up -d --build` 即可一并提供（Windows 的 exe 需在 Windows 上用 `pyinstaller landrop.spec` 构建后同样放入）。
-- Windows 控制台自动切 UTF-8；下载文件名会清洗 Windows 非法字符与保留名（CON、NUL…）。
-- 目录暂不支持，请先打包；文件码是明文 HTTP 下的凭证，仅限可信局域网内使用。
+- **一次性传输**：`landrop send a.zip --server URL --key KEY [--expire 小时] [--max-downloads N]`
+  会在服务端建一个临时传输（默认 24 小时内有效、取 1 次即失效），不会留下空间和授权；
+  到期 / 取够次数 / 被撤销后，后台清理任务连同磁盘文件一起删除。
+- **给没装任何东西的电脑**：服务起来后访问 `http://<地址>/downloads/landrop.pyz` 即可下载单文件客户端。
+- **升级**：数据目录原样可用（数据库迁移只增不改）。旧版只有 `uploads/` 的话，用 `--import` 导入，**不要**直接删除旧目录。
+- `LANDROP_PUBLIC_URL` 必须设为宿主机局域网地址，否则分享链接与文件码里是 Docker 内网地址、别人连不上。
 
 ---
 
@@ -219,7 +175,7 @@ data/
 
 ## 配置项
 
-### 命令行参数
+### `landrop serve` 参数
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -236,7 +192,7 @@ data/
 | `--public-url` | 自动探测 | 分享链接里使用的对外地址；容器内必须设为宿主机局域网地址 |
 | `--no-banner` | 关闭 | 不打印启动横幅（GUI 调用时使用） |
 
-`desktop.py` 另有 `--autostart`（开窗后立即启动）与 `--no-window`（仅按环境变量启动服务）。
+`landrop gui --autostart`：打开窗口后立即启动服务。
 
 ### `.env`（Docker Compose）
 
@@ -253,7 +209,8 @@ data/
 
 ## HTTP API
 
-除首页、`/admin` 与静态资源外，其余接口都需要登录（`HttpOnly` Cookie 会话）。
+除首页、`/admin` 与静态资源外，其余接口都需要登录（`HttpOnly` Cookie 会话）。**直连发送端说同一套最小接口**
+（`login` / `files` / `download` / `done`），所以 `landrop get` 对两种来源通用。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -264,12 +221,14 @@ data/
 | `PUT` | `/api/upload?name=&id=&offset=&total=&sha256=` | 流式分块上传；`sha256` 可选但建议提供 |
 | `DELETE` | `/api/upload/abort?id=` | 放弃未完成的上传并清理分块 |
 | `GET` | `/api/download?id=` | 下载，支持 `Range` 与 `X-File-SHA256` 响应头 |
+| `POST` | `/api/done` | 接收端取完全部文件后调用；传输类授权据此累计次数 |
 | `GET` | `/api/verify?id=` | 从磁盘重算摘要并与登记值比对 |
 | `DELETE` | `/api/delete?id=` | 删除（按权限档判定，管理员可加 `&space=`） |
 | `GET` / `POST` | `/api/grants` | 管理员：列出 / 创建授权 |
-| `POST` | `/api/grants/revoke` | 管理员：撤销授权（`{"id": "..."}`） |
+| `POST` | `/api/grants/revoke` | 管理员：撤销授权（`{"id": "..."}`，对传输同样有效） |
 | `POST` | `/api/grants/rotate` | 管理员：轮换密钥并返回新明文 |
-| `GET` / `POST` | `/api/spaces` | 管理员：列出 / 创建空间 |
+| `GET` / `POST` | `/api/spaces` | 管理员：列出 / 创建空间（不含传输的临时空间） |
+| `GET` / `POST` | `/api/transfers` | 管理员：列出 / 创建一次性传输（`expires_hours`、`max_downloads`） |
 
 管理员操作非自己空间的文件时，加 `&space=<空间ID>`（如 `/api/files?space=sp_xxx`）。
 
@@ -293,19 +252,23 @@ data/
 > 桌面形态没有容器隔离，局域网内任何能连上端口的人都可以尝试登录。
 
 ---
+- **直连发送端**：监听 `0.0.0.0` 的随机端口，令牌 96 位随机、常量时间比较，错误尝试 5 次即关闭；取件完成、超时或 Ctrl-C 后立即停止监听。
+- **路径安全（接收端）**：对端给的路径逐段清洗，拒绝 `..` 与绝对路径，并处理 Windows 非法字符/保留名。
+- **仍是明文 HTTP**：文件码等同凭证，抓包者可直接复制；请只在可信局域网内使用，或自行加 TLS 反代。
+
+---
 
 ## 测试
 
 ```bash
-python3 tests/smoke.py          # 98 项端到端断言：权限矩阵、校验、续传、撤销、空间隔离
-bash tests/binary_check.sh      # 对分发包做同样的登录/上传/摘要/重启验证
+python3 tests/smoke.py          # 服务端：权限矩阵、校验、续传、撤销、空间隔离、一次性传输与迁移
+python3 tests/cli_check.py      # CLI：直连 send/get、经服务器 send、续传、一次性、撤销
+python3 tests/gui_check.py      # 桌面窗口：驱动真实控件走完 发送/接收/取消（Linux 用 xvfb-run）
+bash tests/binary_check.sh dist/landrop   # 对 PyInstaller 产物做登录/上传/摘要/重启验证
 ```
 
-`smoke.py` 会真起一个服务、真发 HTTP 请求，覆盖：三档权限的正反用例、跨访客与跨链接的越权尝试、
-同名文件互不覆盖、错误摘要必须 `422` 且不留文件、断点续传的身份绑定、撤销与轮换的即时生效、
-管理员跨空间操作等。
-
-平台验证边界：上述自动化验证在 Linux 上完成（服务端、GUI 启动器、PyInstaller 单文件产物、Docker 镜像均已实际运行）；Windows 与 macOS 的产物需要在对应系统上各自构建后验证，本项目未做跨平台交叉构建。
+CI 在 Linux、macOS、Windows 上跑前三套测试，并构建各平台二进制、单文件 pyz 与 Docker 镜像；
+推 `vX.Y.Z` 标签会自动发布 Release。
 
 ---
 
@@ -313,18 +276,17 @@ bash tests/binary_check.sh      # 对分发包做同样的登录/上传/摘要/�
 
 ```
 .
-├── server.py            # HTTP 服务与权限判定（标准库）
-├── store.py             # SQLite 持久状态层：空间/授权/访客/会话/文件索引/分块
-├── desktop.py           # 跨平台桌面启动器（tkinter）
-├── landrop.py           # 命令行与核心：send / get / revoke / serve（Linux 主入口）
-├── desktop_share.py     # 桌面启动器的「发送 / 接收」页（Windows / macOS GUI）
-├── static/
-│   ├── index.html       # 访客单页（上传、取件、校验）
-│   └── admin.html       # 管理面板（空间与链接管理）
-├── tests/
-│   ├── smoke.py         # 端到端权限与校验测试
-│   └── binary_check.sh  # 分发包验证脚本
-├── landrop.spec         # PyInstaller 打包配置
+├── landrop/
+│   ├── cli.py           # 统一入口：send / get / serve / revoke / gui
+│   ├── common.py        # 共用：文件码、路径清洗、进度、控制台
+│   ├── direct.py        # 直连发送端（进程内临时 HTTP 监听）
+│   ├── remote.py        # 客户端：上传 / 下载 / 创建传输（服务与直连通用）
+│   ├── server/          # 收集服务：app.py（HTTP 与权限）、store.py（SQLite）、static/（网页）
+│   └── gui/             # 桌面窗口（tkinter）：launcher.py、panels.py
+├── packaging/           # PyInstaller 入口、pyz 构建脚本
+├── tests/               # smoke / cli_check / gui_check / binary_check
+├── landrop.spec         # PyInstaller 配置
+├── pyproject.toml
 ├── Dockerfile
 ├── docker-compose.yml
 └── .env.example
@@ -333,6 +295,12 @@ bash tests/binary_check.sh      # 对分发包做同样的登录/上传/摘要/�
 ---
 
 ## 常见问题
+
+**Q：直连发送时对方连不上？**
+A：先确认两台电脑在同一局域网；发送端系统防火墙首次会弹窗，请选「允许访问」；多网卡/VPN/Docker 环境下发送端会列出「其他可用地址」，把文件码里的 IP 换成可达的那个，或用 `--ip` 指定。
+
+**Q：直连和「经服务器」有什么区别？**
+A：直连不需要任何服务，但发送端必须在线直到对方取完；经服务器会把文件上传到常驻服务，对方随时可取，到期/取够次数后服务端自动清理。
 
 **Q：管理员密钥忘了？**
 A：看启动日志，或读数据目录里的 `admin-key.txt`；也可以用 `--reset-admin --admin-key '新密钥'` 重置。
