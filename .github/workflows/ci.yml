@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.8", "3.12"]
+        exclude:
+          - os: macos-latest      # 3.8 has no arm64 build on macOS runners
+            python: "3.8"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Server smoke tests
+        run: python tests/smoke.py
+      - name: CLI end-to-end tests
+        run: python tests/cli_check.py
+
+  package:
+    name: build check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller
+      - run: pyinstaller --clean --noconfirm landrop.spec
+      - name: CLI binary runs
+        shell: bash
+        run: |
+          ls dist
+          if [ -f dist/landrop-cli.exe ]; then dist/landrop-cli.exe --help; else dist/landrop-cli --help; fi

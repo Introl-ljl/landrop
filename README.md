@@ -1,5 +1,31 @@
 # LAN Drop · 局域网文件收集与快捷分享
 
+[![CI](https://github.com/Introl-ljl/landrop/actions/workflows/ci.yml/badge.svg)](https://github.com/Introl-ljl/landrop/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)
+![Zero dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen)
+
+**English summary** — A zero-dependency (Python stdlib) LAN file collector/sharer. Run the server on one
+machine; others upload/download from a browser with per-link permissions (upload-only / read + delete-own /
+full), SHA-256 verification and resumable uploads. Quick transfer with a **file code**:
+`landrop.py send a.zip` prints a code + a command, the receiver runs `landrop.py get <code>`.
+Windows/macOS get a GUI launcher, Linux gets the CLI, Docker is supported. MIT licensed.
+
+## 下载 / Download
+
+到 [Releases](https://github.com/Introl-ljl/landrop/releases) 下载对应平台的产物（含 `SHA256SUMS`）：
+
+| 平台 | 文件 |
+| --- | --- |
+| Windows | `landrop-windows-x86_64.exe`（GUI）、`landrop-cli-windows-x86_64.exe`、`landrop-server-windows-x86_64.exe` |
+| macOS (Apple Silicon / Intel) | `landrop-macos-arm64` / `landrop-macos-x86_64`（GUI），以及同名系列的 `-cli-`、`-server-` |
+| Linux (x86_64 / arm64) | `landrop-cli-linux-*`、`landrop-server-linux-*`（Linux 只提供命令行） |
+| Docker | `docker pull ghcr.io/introl-ljl/landrop:latest` |
+| 任意有 Python 的系统 | 只下载 `landrop.py`（客户端，单文件） |
+
+> macOS 二进制未签名：首次运行请在「系统设置 → 隐私与安全性」允许，或 `xattr -d com.apple.quarantine <文件>`。
+> Windows 可能出现 SmartScreen 提示，选择「仍要运行」。
+
 在一台电脑上启动，同一局域网内的手机与电脑用浏览器打开链接即可**投递文件、取件、按权限删除**。
 文件全部落在本机（或你指定的磁盘目录），链接可随时撤销，上传完成会给出一份
 **服务端实算的 SHA-256 校验值**。
@@ -329,3 +355,9 @@ A：可以。手机与电脑连同一局域网，浏览器打开链接即可，�
 
 **Q：删除的文件去哪了？**
 A：`data/trash/<空间>/` 下，确认不需要后再自行清理。
+
+---
+
+## 参与贡献 / License
+
+欢迎 issue 与 PR，开发约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。以 [MIT](LICENSE) 协议开源。
