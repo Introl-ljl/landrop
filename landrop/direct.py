@@ -16,6 +16,22 @@ import urllib.parse
 from .common import CliError, human, sha256_file
 
 
+def _hostname_ips(timeout: float) -> list[str]:
+    """按主机名解析本机地址（多网卡时用来列出备选）。解析可能走 DNS 而卡很久，所以限时。"""
+    result: list[str] = []
+
+    def work():
+        try:
+            result.extend(socket.gethostbyname_ex(socket.gethostname())[2])
+        except OSError:
+            pass
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout)
+    return list(result)
+
+
 def lan_addresses() -> list[str]:
     """本机可能被局域网访问到的 IPv4 地址，首选地址排第一（装了 docker/VPN 时可能不止一个）。"""
     found: list[str] = []
@@ -25,12 +41,9 @@ def lan_addresses() -> list[str]:
             found.append(s.getsockname()[0])
     except OSError:
         pass
-    try:
-        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
-            if ip not in found:
-                found.append(ip)
-    except OSError:
-        pass
+    for ip in _hostname_ips(1.0):
+        if ip not in found:
+            found.append(ip)
     found = [ip for ip in found if not ip.startswith("127.")]
     return found or ["127.0.0.1"]
 
