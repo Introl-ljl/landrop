@@ -38,7 +38,8 @@ jobs:
             case "$base" in *.exe) ext=".exe"; base="${base%.exe}";; esac
             cp "$f" "out/${base}-${{ matrix.target }}${ext}"
           done
-          cp landrop.py out/landrop.py
+          # 单文件客户端只由一个构建提供，避免合并下载时多个产物同名冲突
+          if [ "${{ matrix.target }}" = "linux-x86_64" ]; then cp landrop.py out/landrop.py; fi
           ls -l out
       - uses: actions/upload-artifact@v4
         with:
@@ -60,7 +61,6 @@ jobs:
       - name: Checksums
         run: |
           cd artifacts
-          # landrop.py is identical across builds; keep one copy
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
       - name: Publish release
