@@ -114,7 +114,12 @@ def main():
     )
     try:
         if not wait_port(port):
-            out = proc.stdout.read() if proc.stdout else ""
+            proc.terminate()      # 先结束进程再读输出，否则 read() 会一直阻塞
+            try:
+                out, _ = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, _ = proc.communicate()
             print("服务未能启动:\n", out)
             return 1
         run_checks(port, data_dir)
