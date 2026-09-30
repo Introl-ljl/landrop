@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "landrop"
+dynamic = ["version"]
+description = "LAN file transfer: direct file-code send/get, plus a self-hosted collection server. Zero dependencies."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["file-transfer", "lan", "cli", "self-hosted"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "Topic :: System :: Networking",
+]
+
+[project.urls]
+Homepage = "https://github.com/Introl-ljl/landrop"
+
+[project.scripts]
+landrop = "landrop.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "landrop.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["landrop*"]
+
+[tool.setuptools.package-data]
+"landrop.server" = ["static/*.html", "static/**/*"]

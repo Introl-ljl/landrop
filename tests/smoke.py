@@ -109,10 +109,10 @@ def main():
     log_path = os.path.join(tmp, "server.log")
     log_fh = open(log_path, "wb")
     proc = subprocess.Popen(
-        [sys.executable, os.path.join(ROOT, "server.py"),
+        [sys.executable, "-m", "landrop", "serve",
          "--data-dir", data_dir, "--host", "127.0.0.1", "--port", str(port),
          "--admin-key", "admin-secret-123"],
-        stdout=log_fh, stderr=subprocess.STDOUT,
+        stdout=log_fh, stderr=subprocess.STDOUT, cwd=ROOT,
     )
 
     def server_log() -> str:
@@ -388,7 +388,7 @@ def run_checks(port, data_dir):
         fh.write(b"nested")
     before = sorted(os.listdir(src))
     sys.path.insert(0, ROOT)
-    import store as sm
+    from landrop.server import store as sm
     st_obj = sm.Store(data_dir)
     rep = st_obj.import_directory(default_space, src, recursive=True)
     names = sorted(r["source"] for r in rep["imported"])

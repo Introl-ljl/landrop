@@ -19,27 +19,13 @@ import os
 import socket
 import sys
 import threading
-import time
 import traceback
 import webbrowser
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+from landrop.common import default_data_dir
+from landrop.server import app as srv
 
-import server as srv  # noqa: E402
-import desktop_share  # noqa: E402
-
-
-def default_data_dir() -> str:
-    """按平台惯例给出可写的数据目录（不放在安装目录里）。"""
-    if sys.platform.startswith("win"):
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "LANDrop")
-    if sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Application Support/LANDrop")
-    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return os.path.join(base, "landrop")
+from . import panels
 
 
 def port_free(port: int) -> bool:
@@ -141,7 +127,7 @@ class LauncherApp:
                                    state="disabled")
         self.copy_btn.pack(side="left", padx=6)
 
-        self.share = desktop_share.SharePanels(
+        self.share = panels.SharePanels(
             self.root, self.notebook,
             default_url=f"http://127.0.0.1:{self.port_var.get().strip() or '8000'}")
 
@@ -245,7 +231,8 @@ class LauncherApp:
         try:
             self.httpd.serve_forever()
         except Exception as exc:  # noqa: BLE001
-            self.root.after(0, lambda: self.write(f"\n服务异常：{exc!r}\n"))
+            msg = f"\n服务异常：{exc!r}\n"      # 先取值：except 结束后 exc 会被删除，lambda 里再用会 NameError
+            self.root.after(0, lambda: self.write(msg))
 
     def stop(self):
         if self.httpd:

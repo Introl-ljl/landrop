@@ -14,9 +14,9 @@
 
 运行::
 
-    python3 server.py --data-dir ./data
-    python3 server.py --data-dir ./data --dir /srv/share     # 指定共享目录
-    python3 server.py --data-dir ./data --import ./uploads   # 导入历史目录
+    landrop serve --data-dir ./data
+    landrop serve --data-dir ./data --dir /srv/share     # 指定共享目录
+    landrop serve --data-dir ./data --import ./uploads   # 导入历史目录
 """
 
 from __future__ import annotations
@@ -37,15 +37,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+from landrop import __version__ as VERSION
 
-import store as store_mod  # noqa: E402
-from store import Store  # noqa: E402
+from . import store as store_mod
+from .store import Store
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 APP_NAME = "LAN Drop"
-VERSION = "2.0"
 CHUNK_SIZE = 1024 * 1024
 MAX_KEY_ATTEMPTS = 10
 ATTEMPT_WINDOW = 60
@@ -75,14 +74,40 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+_static_cache: str | None = None
+
+
 def resource_dir() -> str:
-    """静态资源目录；兼容 PyInstaller 解包目录。"""
+    """静态资源目录；兼容 PyInstaller 解包目录，以及 zipapp（.pyz）里不能按路径读文件的情况。"""
+    global _static_cache
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        cand = os.path.join(base, "static")
+        cand = os.path.join(base, "landrop", "server", "static")
         if os.path.isdir(cand):
             return cand
-    return os.path.join(_HERE, "static")
+    plain = os.path.join(_HERE, "static")
+    if os.path.isdir(plain):
+        return plain
+    if _static_cache is None:                      # 在 .pyz 里：把 static 解到临时目录一次
+        import tempfile
+        import zipfile
+        archive = _HERE
+        while archive and not os.path.isfile(archive):
+            parent = os.path.dirname(archive)
+            if parent == archive:
+                break
+            archive = parent
+        dest = tempfile.mkdtemp(prefix="landrop-static-")
+        prefix = os.path.relpath(_HERE, archive).replace(os.sep, "/") + "/static/"
+        with zipfile.ZipFile(archive) as zf:
+            for name in zf.namelist():
+                if name.startswith(prefix) and not name.endswith("/"):
+                    target = os.path.join(dest, name[len(prefix):])
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with open(target, "wb") as f:
+                        f.write(zf.read(name))
+        _static_cache = dest
+    return _static_cache
 
 
 def local_ip() -> str:
@@ -1093,17 +1118,18 @@ class Handler(BaseHTTPRequestHandler):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
+        prog="landrop serve",
         description="LAN Drop - 局域网文件收集与快捷分享（多空间 / 多链接 / 服务端校验）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例:\n"
-            "  python3 server.py --data-dir ./data\n"
-            "  python3 server.py --data-dir ./data --dir /srv/share\n"
-            "  python3 server.py --data-dir ./data --import ./uploads\n"
-            "  python3 server.py --data-dir ./data --admin-key '我的管理密钥'\n"
+            "  landrop serve --data-dir ./data\n"
+            "  landrop serve --data-dir ./data --dir /srv/share\n"
+            "  landrop serve --data-dir ./data --import ./uploads\n"
+            "  landrop serve --data-dir ./data --admin-key '我的管理密钥'\n"
         ),
     )
-    p.add_argument("--data-dir", default=os.path.join(_HERE, "data"),
+    p.add_argument("--data-dir", default=os.path.join(os.getcwd(), "data"),
                    help="数据目录：state.sqlite3 / files / partial / trash（默认 ./data）")
     p.add_argument("--dir", default="",
                    help="把默认空间的共享目录放到指定位置（默认 <data-dir>/files/<空间名>）")

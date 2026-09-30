@@ -38,8 +38,10 @@ jobs:
             case "$base" in *.exe) ext=".exe"; base="${base%.exe}";; esac
             cp "$f" "out/${base}-${{ matrix.target }}${ext}"
           done
-          # 单文件客户端只由一个构建提供，避免合并下载时多个产物同名冲突
-          if [ "${{ matrix.target }}" = "linux-x86_64" ]; then cp landrop.py out/landrop.py; fi
+          # 单文件 zipapp 只由一个构建提供（与平台无关），避免同名产物冲突
+          if [ "${{ matrix.target }}" = "linux-x86_64" ]; then
+            python packaging/build_pyz.py out/landrop.pyz
+          fi
           ls -l out
       - uses: actions/upload-artifact@v4
         with:

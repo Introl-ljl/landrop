@@ -11,9 +11,9 @@ import os
 import queue
 import sys
 import threading
-import webbrowser
 
-import landrop as core
+from landrop import common as core_common
+from landrop import remote as core_remote
 
 
 def open_path(path: str):
@@ -45,7 +45,7 @@ class Worker:
             try:
                 res = fn(lambda *a: self.q.put(("p", on_progress, a)))
                 self.q.put(("ok", on_ok, (res,)))
-            except core.CliError as exc:
+            except core_common.CliError as exc:
                 self.q.put(("err", on_err, (str(exc),)))
             except Exception as exc:  # noqa: BLE001
                 self.q.put(("err", on_err, (f"{type(exc).__name__}: {exc}",)))
@@ -96,8 +96,8 @@ class SharePanels:
 
         ttk.Label(f, text="管理员密钥").grid(row=1, column=0, sticky="w", **pad)
         try:
-            key = os.environ.get("LANDROP_ADMIN_KEY") or core.read_admin_key()
-        except core.CliError:
+            key = os.environ.get("LANDROP_ADMIN_KEY") or core_remote.read_admin_key()
+        except core_common.CliError:
             key = ""
         self.s_key = tk.StringVar(value=key)
         ttk.Entry(f, textvariable=self.s_key, show="•").grid(row=1, column=1, columnspan=2,
@@ -162,7 +162,7 @@ class SharePanels:
             p = os.path.abspath(p)
             if p not in self.files:
                 self.files.append(p)
-                self.listbox.insert("end", f"{os.path.basename(p)}   ({core.human(os.path.getsize(p))})")
+                self.listbox.insert("end", f"{os.path.basename(p)}   ({core_common.human(os.path.getsize(p))})")
 
     def remove_files(self):
         for i in reversed(self.listbox.curselection()):
@@ -175,7 +175,7 @@ class SharePanels:
 
     def _set_bar(self, name, done, total):
         self.s_bar["value"] = 100 if not total else done * 100 // total
-        self.s_msg.set(f"正在上传 {name}  {core.human(done)}/{core.human(total)}")
+        self.s_msg.set(f"正在上传 {name}  {core_common.human(done)}/{core_common.human(total)}")
 
     def do_send(self):
         if not self.files:
@@ -204,7 +204,7 @@ class SharePanels:
             self.last_grant = res["grant_id"]
             for b in (self.copy_code_btn, self.copy_cmd_btn, self.revoke_btn):
                 b.configure(state="normal")
-            self.s_msg.set(f"完成：{res['count']} 个文件，{core.human(res['bytes'])}。"
+            self.s_msg.set(f"完成：{res['count']} 个文件，{core_common.human(res['bytes'])}。"
                            "把文件码或取件命令发给对方即可。")
 
         def err(msg):
@@ -213,7 +213,7 @@ class SharePanels:
             self.messagebox.showerror("发送失败", msg)
 
         self.worker.run(
-            lambda cb: core.send_files(url, key, files, expire, "", "", cb),
+            lambda cb: core_remote.send_files(url, key, files, expire, "", "", cb),
             self._set_bar, ok, err)
 
     def _copy(self, text):
@@ -233,7 +233,7 @@ class SharePanels:
         url, key, gid = self.s_url.get().strip(), self.s_key.get().strip(), self.last_grant
 
         def run(cb):
-            cli = core.Client(url)
+            cli = core_remote.Client(url)
             cli.login(key)
             cli.request("POST", "/api/grants/revoke", {"id": gid})
             return gid
@@ -285,7 +285,7 @@ class SharePanels:
 
     def paste_code(self):
         try:
-            self.r_code.set(core.extract_code(self.root.clipboard_get()))
+            self.r_code.set(core_common.extract_code(self.root.clipboard_get()))
         except self.tk.TclError:
             pass
 
@@ -306,7 +306,7 @@ class SharePanels:
         self.r_log.configure(state="disabled")
 
     def do_recv(self):
-        code = core.extract_code(self.r_code.get())
+        code = core_common.extract_code(self.r_code.get())
         directory = os.path.expanduser(self.r_dir.get().strip())
         if not code or not directory:
             self.messagebox.showinfo("信息不全", "请填写文件码和保存目录。")
@@ -319,15 +319,15 @@ class SharePanels:
 
         def prog(name, done, total):
             self.r_bar["value"] = 100 if not total else done * 100 // total
-            self.r_msg.set(f"正在下载 {name}  {core.human(done)}/{core.human(total)}")
+            self.r_msg.set(f"正在下载 {name}  {core_common.human(done)}/{core_common.human(total)}")
 
         def run(cb):
-            return core.fetch_files(code, directory, None, force, cb,
+            return core_remote.fetch_files(code, directory, None, force, cb,
                                     lambda item, target: cb("done", item["size"], target))
 
         def progress(*a):
             if a[0] == "done":
-                self._log(f"✓ {a[2]}  ({core.human(a[1])}，已校验 SHA-256)\n")
+                self._log(f"✓ {a[2]}  ({core_common.human(a[1])}，已校验 SHA-256)\n")
             else:
                 prog(*a)
 

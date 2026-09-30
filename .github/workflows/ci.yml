@@ -34,6 +34,7 @@ jobs:
   package:
     name: build check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -45,8 +46,14 @@ jobs:
           python-version: "3.12"
       - run: pip install pyinstaller
       - run: pyinstaller --clean --noconfirm landrop.spec
-      - name: CLI binary runs
+      - run: python packaging/build_pyz.py
+      - name: Binaries run
         shell: bash
         run: |
           ls dist
-          if [ -f dist/landrop-cli.exe ]; then dist/landrop-cli.exe --help; else dist/landrop-cli --help; fi
+          if [ -f dist/landrop.exe ]; then BIN=dist/landrop.exe; else BIN=dist/landrop; fi
+          "$BIN" --version
+          python dist/landrop.pyz --version
+      - name: Packaged server end-to-end
+        if: runner.os == 'Linux'
+        run: bash tests/binary_check.sh dist/landrop

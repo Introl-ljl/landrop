@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""landrop.py 命令行端到端测试：真起服务 → send 多文件 → get 到指定目录 → 校验内容 → revoke。
+"""landrop 命令行端到端测试：真起服务 → send 多文件 → get 到指定目录 → 校验内容 → revoke。
 
 用法: python3 tests/cli_check.py
 """
@@ -29,7 +29,7 @@ for _s in (sys.stdout, sys.stderr):
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-import landrop  # noqa: E402
+from landrop import cli as landrop, common  # noqa: E402
 
 KEY = "cli-test-key"
 FAILED = []
@@ -57,7 +57,7 @@ def run(argv):
 def start_direct_sender(args):
     """以子进程启动直连发送端；后台线程读 stdout，避免读管道把测试卡死。"""
     proc = subprocess.Popen(
-        [sys.executable, "-u", os.path.join(ROOT, "landrop.py"), "send", *args, "--ip", "127.0.0.1"],
+        [sys.executable, "-u", "-m", "landrop", "send", *args, "--ip", "127.0.0.1"], cwd=ROOT,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
         errors="replace", env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     lines: "queue.Queue[str]" = queue.Queue()
@@ -117,11 +117,11 @@ def direct_checks(tmp):
     except subprocess.TimeoutExpired:
         proc.kill()
         check(False, "连续错误令牌后发送端关闭")
-    check(landrop.safe_relpath("a/b/c.txt") == os.path.join("a", "b", "c.txt"), "safe_relpath 正常路径")
+    check(common.safe_relpath("a/b/c.txt") == os.path.join("a", "b", "c.txt"), "safe_relpath 正常路径")
     try:
-        landrop.safe_relpath("../../etc/passwd")
+        common.safe_relpath("../../etc/passwd")
         check(False, "safe_relpath 拒绝 ..")
-    except landrop.CliError:
+    except common.CliError:
         check(True, "safe_relpath 拒绝 ..")
 
 
@@ -130,9 +130,9 @@ def main():
     port = free_port()
     server = f"http://127.0.0.1:{port}"
     proc = subprocess.Popen(
-        [sys.executable, os.path.join(ROOT, "server.py"), "--data-dir", os.path.join(tmp, "data"),
+        [sys.executable, "-m", "landrop", "serve", "--data-dir", os.path.join(tmp, "data"),
          "--host", "127.0.0.1", "--port", str(port), "--admin-key", KEY, "--no-banner"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
     try:
         for _ in range(100):
             with socket.socket() as s:
@@ -167,9 +167,9 @@ def main():
         check(rc == 0 and os.path.isfile(os.path.join(dest, "a (1).bin")), "同名自动改名")
         rc, out, _ = run(["get", "extract-me", "--list"])
         check(rc == 1, "文件码格式错误返回非零")
-        check(landrop.extract_code(f"python3 landrop.py get {code}  ") == code, "extract_code 认整条命令")
-        check(landrop.safe_local_name("CON.txt") == "_CON.txt"
-              and landrop.safe_local_name("a:b?.txt. ") == "a_b_.txt", "Windows 文件名清洗")
+        check(common.extract_code(f"python3 landrop.py get {code}  ") == code, "extract_code 认整条命令")
+        check(common.safe_local_name("CON.txt") == "_CON.txt"
+              and common.safe_local_name("a:b?.txt. ") == "a_b_.txt", "Windows 文件名清洗")
 
         rc, _, _ = run(["send", os.path.join(src, "nope"), "--server", server, "--key", KEY])
         check(rc == 1, "不存在的文件报错")

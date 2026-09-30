@@ -1,13 +1,13 @@
 #!/bin/bash
-# 二进制产物端到端验证：启动 -> 登录 -> 建链接 -> 上传(带 SHA-256) -> 校验 -> 下载比对
+# 二进制产物端到端验证（landrop serve）：启动 -> 登录 -> 建链接 -> 上传(带 SHA-256) -> 校验 -> 下载比对
 set -u
 cd "$(dirname "$0")/.." 2>/dev/null || true
-BIN="${1:-./dist/landrop-server}"
+BIN="${1:-./dist/landrop}"
 [ -x "$BIN" ] || { echo "找不到可执行文件: $BIN"; exit 1; }
 
 D=$(mktemp -d)
 P=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
-"$BIN" --data-dir "$D/data" --host 127.0.0.1 --port "$P" > "$D/log" 2>&1 &
+"$BIN" serve --data-dir "$D/data" --host 127.0.0.1 --port "$P" > "$D/log" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; rm -rf "$D"' EXIT
 
@@ -69,7 +69,7 @@ BAD=$(curl -s -o /dev/null -w '%{http_code}' -b "$D/v.txt" -X PUT --data-binary 
 
 echo "[8] 重启后数据仍在（同一数据目录）"
 kill $PID 2>/dev/null; wait $PID 2>/dev/null
-"$BIN" --data-dir "$D/data" --host 127.0.0.1 --port "$P" > "$D/log2" 2>&1 &
+"$BIN" serve --data-dir "$D/data" --host 127.0.0.1 --port "$P" > "$D/log2" 2>&1 &
 PID=$!
 for _ in $(seq 1 60); do curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$P/" && break; sleep 0.25; done
 curl -s -c "$D/c2.txt" -X POST -H 'Content-Type: application/json' -d "{\"key\":\"$KEY\"}" \
@@ -87,7 +87,7 @@ echo "keep-content" > "$LEG/keep.txt"
 echo "nested" > "$LEG/sub/deep.txt"
 touch "$LEG/.gitkeep"
 P2=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
-"$BIN" --data-dir "$D/data2" --import "$LEG" --import-recursive --host 127.0.0.1 --port "$P2" > "$D/log3" 2>&1 &
+"$BIN" serve --data-dir "$D/data2" --import "$LEG" --import-recursive --host 127.0.0.1 --port "$P2" > "$D/log3" 2>&1 &
 PID=$!
 for _ in $(seq 1 60); do curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$P2/" && break; sleep 0.25; done
 COUNT=$(python3 - "$D/data2/state.sqlite3" <<'PY'
