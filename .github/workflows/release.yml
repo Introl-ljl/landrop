@@ -56,10 +56,11 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          merge-multiple: true
+          path: downloaded
       - name: Checksums
         run: |
+          mkdir artifacts
+          find downloaded -type f -exec cp {} artifacts/ \;
           cd artifacts
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
