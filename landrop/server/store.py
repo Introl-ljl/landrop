@@ -331,7 +331,8 @@ class Store:
         """临时空间 + 只读授权：到期/用完/撤销后由 cleanup_transfers 连文件一起清理。
         返回 (grant_row, 明文令牌, space_id)。"""
         sid = self.create_space("transfer-" + secrets.token_hex(3))
-        self._write("UPDATE spaces SET transient=1 WHERE id=?", (sid,))
+        # 目录名保持 transfer-xxxx；显示名用备注（浏览器打开文件码时看到的是「报告.pdf, 相册」而不是内部名）
+        self._write("UPDATE spaces SET transient=1, name=? WHERE id=?", ((label or "一次性传输")[:60], sid))
         row, secret = self.create_grant(kind="share", space_id=sid, perm="read", mode="token",
                                         label=label, expires_at=expires_at)
         if max_downloads:

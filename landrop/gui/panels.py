@@ -122,6 +122,7 @@ class SendPage(Page):
         super().__init__(parent, app)
         s = app.settings
         self.files: list[str] = []
+        self._stats: dict[str, tuple[int, int]] = {}     # 路径 → (文件数, 字节数)，大文件夹只遍历一次
         self.sender: direct.DirectSender | None = None
         self.busy = False
         self._cancel = False
@@ -270,6 +271,11 @@ class SendPage(Page):
             p = os.path.abspath(p)
             if p not in self.files and os.path.exists(p):
                 self.files.append(p)
+                if os.path.isdir(p):
+                    entries = common.collect_entries([p])
+                    self._stats[p] = (len(entries), sum(os.path.getsize(f) for f, _ in entries))
+                else:
+                    self._stats[p] = (1, os.path.getsize(p))
         self._refresh_list()
 
     def add_files(self):
@@ -300,15 +306,8 @@ class SendPage(Page):
             return
         self.drop_big.pack_forget()
         self.list_card.pack(fill="x", pady=(0, T.px(14)), after=self.drop_card)
-        total, nfiles = 0, 0
-        for p in self.files:
-            if os.path.isdir(p):
-                for _full, rel in common.collect_entries([p]):
-                    nfiles += 1
-                    total += os.path.getsize(_full)
-            else:
-                nfiles += 1
-                total += os.path.getsize(p)
+        nfiles = sum(self._stats[p][0] for p in self.files)
+        total = sum(self._stats[p][1] for p in self.files)
         self.count_label.configure(text=f"已选 {len(self.files)} 项 · {nfiles} 个文件 · {common.human(total)}")
         for i, p in enumerate(self.files[:80]):
             if i:
@@ -331,11 +330,8 @@ class SendPage(Page):
         info.pack(side="left", fill="x", expand=True, padx=(T.px(12), T.px(8)))
         name = os.path.basename(p.rstrip("/\\")) or p
         W.label(info, W.elide(name), size=10, weight="bold").pack(anchor="w")
-        if is_dir:
-            n = len(common.collect_entries([p]))
-            sub = f"文件夹 · {n} 个文件"
-        else:
-            sub = common.human(os.path.getsize(p))
+        n, size = self._stats[p]
+        sub = f"文件夹 · {n} 个文件 · {common.human(size)}" if is_dir else common.human(size)
         W.label(info, f"{sub}  ·  {W.elide(os.path.dirname(p), 60)}", role="muted", size=9).pack(anchor="w")
         W.IconButton(r, "x", lambda: self.remove(p), size=30, tooltip="移除").pack(side="right")
 
@@ -704,6 +700,7 @@ class ReceivePage(Page):
         self.history: list[tuple[int, str]] = []
 
         c = self.card(padding=22)
+        self.input_card = c
         b = c.body
         W.label(b, "文件码", size=10, weight="bold").pack(anchor="w", pady=(0, T.px(6)))
         r = row(b)
@@ -821,7 +818,7 @@ class ReceivePage(Page):
             self.cancel_btn.pack_forget()
 
     def _show_task(self, pill, kind, title):
-        self.task_card.pack(fill="x", pady=(0, T.px(14)), after=self.wrap.winfo_children()[1])
+        self.task_card.pack(fill="x", pady=(0, T.px(14)), after=self.input_card)
         self.task_pill.set(pill, kind)
         self.task_title.configure(text=title)
         self.open_btn.pack_forget()
