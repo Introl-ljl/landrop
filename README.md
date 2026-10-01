@@ -24,22 +24,24 @@ portable build. A file code is also a URL, so phones can receive with just a bro
 ## 下载 / 安装
 
 到 [Releases](https://github.com/Introl-ljl/landrop/releases) 下载（含 `SHA256SUMS`）。每个平台都有**安装版**和**免安装版**，
-两者都是同一个程序：**桌面窗口 + `landrop` 命令行**共用一份运行时，不再有单独的命令行安装包。
+每个文件都是单独的附件，下载即可用：**桌面窗口 + `landrop` 命令行**共用一份运行时，不再有单独的命令行安装包。
 
-| 平台 | 安装版 | 免安装版 |
+| 平台 | 安装版 | 免安装版（无需安装、无需解压） |
 | --- | --- | --- |
-| Windows x64 | `LANDrop-<版本>-windows-x86_64-setup.exe` | `LANDrop-<版本>-windows-x86_64-portable.zip` |
-| macOS Apple 芯片 | `LANDrop-<版本>-macos-arm64-setup.pkg` | `LANDrop-<版本>-macos-arm64-portable.zip` |
-| macOS Intel | `LANDrop-<版本>-macos-x86_64-setup.pkg` | `LANDrop-<版本>-macos-x86_64-portable.zip` |
-| Linux x64 / arm64 | `LANDrop-<版本>-linux-<架构>-setup.deb` | `LANDrop-<版本>-linux-<架构>-portable.tar.gz` |
+| Windows x64 | `LANDrop-<版本>-windows-x86_64-setup.exe` | `LANDrop-<版本>-windows-x86_64-portable.exe`（单文件，只有窗口）<br>`LANDrop-<版本>-windows-x86_64-portable.zip`（需解压，含命令行，数据跟着程序目录） |
+| macOS Apple 芯片 | `LANDrop-<版本>-macos-arm64-setup.pkg` | `LANDrop-<版本>-macos-arm64-portable.dmg` |
+| macOS Intel | `LANDrop-<版本>-macos-x86_64-setup.pkg` | `LANDrop-<版本>-macos-x86_64-portable.dmg` |
+| Linux x64 / arm64 | `LANDrop-<版本>-linux-<架构>-setup.deb` | `LANDrop-<版本>-linux-<架构>-portable.AppImage` |
 
 | 形态 | 装了什么 | 命令行在哪 | 数据在哪 |
 | --- | --- | --- | --- |
 | Windows 安装版 | 开始菜单「LAN Drop」「LAN Drop 命令行」；默认装到当前用户，不需要管理员 | 勾选「添加到 PATH」（默认勾选）后任意终端可用 `landrop`；卸载时自动移除 | `%APPDATA%\LANDrop` |
 | macOS 安装版 | `/Applications/LAN Drop.app` | 安装时自动链接 `/usr/local/bin/landrop` | `~/Library/Application Support/LANDrop` |
 | Linux 安装版（.deb） | `/opt/landrop`，应用菜单里的「LAN Drop」 | `/usr/bin/landrop`（窗口：`landrop-gui`） | `~/.local/share/landrop` |
-| 免安装版（Win / Linux） | 解压即用：`LAN Drop.exe` / `landrop-gui` 与 `landrop(.exe)` 在同一目录 | 直接运行目录里的 `landrop`，或在窗口「设置 → 命令行工具」一键加入 PATH | **程序目录下的 `data/`**，整个文件夹可拷走（删掉 `portable.txt` 则改用系统目录） |
-| 免安装版（macOS） | `LAN Drop.app`，放在任意位置运行 | `LAN Drop.app/Contents/MacOS/landrop`，或「设置 → 命令行工具」一键链接 | 同安装版（`.app` 内部不可写） |
+| Windows 单文件版 `portable.exe` | 双击即用 | 不含（Windows 程序只能二选一当窗口或控制台程序）；命令行用安装版、zip 版或 pyz | 同安装版 |
+| Windows zip 版 | 解压即用：`LAN Drop.exe` 与 `landrop.exe` 在同一目录 | 直接运行目录里的 `landrop.exe`，或在窗口「设置 → 命令行工具」一键加入 PATH | **程序目录下的 `data/`**，整个文件夹可拷走（删掉 `portable.txt` 则改用系统目录） |
+| macOS `portable.dmg` | 打开后双击 `LAN Drop.app` 直接运行，或拖到任意位置 | `LAN Drop.app/Contents/MacOS/landrop`，或「设置 → 命令行工具」一键链接 | 同安装版（`.app` 内部不可写） |
+| Linux `portable.AppImage` | `chmod +x` 后运行：不带参数打开窗口 | 带参数运行它就是命令行（`./LANDrop-….AppImage send a.zip`），或「设置 → 命令行工具」链接到 `~/.local/bin/landrop` | 同安装版 |
 | 任意装了 Python 3.8+ 的系统 | `landrop.pyz` 单文件 | `python3 landrop.pyz send …` | 同上表各平台默认目录 |
 | Docker | `docker pull ghcr.io/introl-ljl/landrop:latest`（收集服务） | — | 挂载的 `/data` |
 | 从源码 | `git clone …` 后 `python3 -m landrop`，或 `pip install .` 得到 `landrop` 与 `landrop-gui` | | |
@@ -309,7 +311,7 @@ python packaging/build_pyz.py                  # 单文件 landrop.pyz
 ```
 
 CI 在 Linux、macOS、Windows 上跑前三套测试；每个平台构建安装版与免安装版后**真实安装、运行 `package_check.py`、再卸载**
-（Windows 静默安装 + PATH 检查，macOS `installer -pkg`，Linux `apt install ./*.deb`），免安装版也会解压验证。
+（Windows 静默安装 + PATH 检查，macOS `installer -pkg`，Linux `apt install ./*.deb`），免安装版（单文件 exe、zip、dmg、AppImage）也逐个验证。
 推 `vX.Y.Z` 标签会自动发布 Release 与 Docker 镜像。
 
 ---
@@ -355,8 +357,11 @@ A：它和窗口是同一个程序。Windows 安装时默认把安装目录加�
 `/usr/local/bin/landrop`；Linux 是 `/usr/bin/landrop`。免安装版在窗口「设置 → 命令行工具」里一键加入 PATH。
 
 **Q：免安装版的数据存在哪？**
-A：Windows / Linux 免安装版存在程序目录的 `data/` 里（目录里有 `portable.txt` 时），整个文件夹拷走即可；
-macOS 的 `.app` 内部不可写，所以仍用 `~/Library/Application Support/LANDrop`。
+A：Windows zip 版存在程序目录的 `data/` 里（目录里有 `portable.txt` 时），整个文件夹拷走即可；
+Windows 单文件版、macOS dmg、Linux AppImage 与安装版相同，存在各平台的用户数据目录（见上表）。
+
+**Q：AppImage 打不开，提示 FUSE？**
+A：安装 `libfuse2`（或 `fuse3`），或者用 `./LANDrop-….AppImage --appimage-extract-and-run` 运行。
 
 **Q：管理员密钥忘了？**
 A：看启动日志，或读数据目录里的 `admin-key.txt`；也可以用 `--reset-admin --admin-key '新密钥'` 重置。

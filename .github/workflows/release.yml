@@ -34,9 +34,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 每个安装包都是单独的附件（不再按平台打成 zip）；说明写在发布页最上面
+          cat > notes.md <<'MD'
+          ## 下载哪个？
+
+          | 平台 | 安装版（含命令行 `landrop`） | 免安装版 |
+          | --- | --- | --- |
+          | Windows x64 | `…-windows-x86_64-setup.exe` | `…-windows-x86_64-portable.exe`：单文件，双击即用（只有窗口）<br>`…-windows-x86_64-portable.zip`：解压即用，含窗口 + 命令行，数据跟着程序目录 |
+          | macOS Apple 芯片 | `…-macos-arm64-setup.pkg` | `…-macos-arm64-portable.dmg` |
+          | macOS Intel | `…-macos-x86_64-setup.pkg` | `…-macos-x86_64-portable.dmg` |
+          | Linux x64 | `…-linux-x86_64-setup.deb` | `…-linux-x86_64-portable.AppImage`（`chmod +x` 后运行；带参数即命令行） |
+          | Linux arm64 | `…-linux-arm64-setup.deb` | `…-linux-arm64-portable.AppImage` |
+
+          装了 Python 3.8+ 的任意系统：`landrop.pyz`。校验值见 `SHA256SUMS`。二进制未签名，首次运行的系统提示见 README。
+          MD
           gh release create "${{ github.ref_name }}" artifacts/* \
             --repo "${{ github.repository }}" \
-            --title "${{ github.ref_name }}" --generate-notes
+            --title "${{ github.ref_name }}" --notes-file notes.md --generate-notes
 
   docker:
     if: startsWith(github.ref, 'refs/tags/v')

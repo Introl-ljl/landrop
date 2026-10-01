@@ -5,14 +5,15 @@
 
 产物（<v> 为 landrop.__version__）::
 
-    Windows  LANDrop-<v>-windows-x86_64-setup.exe     Inno Setup 安装程序（可选加入 PATH）
-             LANDrop-<v>-windows-x86_64-portable.zip  解压即用，数据存放在程序目录 data/
-    macOS    LANDrop-<v>-macos-<arch>-setup.pkg       装到 /Applications，并链接 /usr/local/bin/landrop
-             LANDrop-<v>-macos-<arch>-portable.zip    LAN Drop.app，拖到任意位置运行
-    Linux    LANDrop-<v>-linux-<arch>-setup.deb       /opt/landrop + /usr/bin/landrop(-gui) + 桌面菜单
-             LANDrop-<v>-linux-<arch>-portable.tar.gz 解压即用，数据存放在程序目录 data/
+    Windows  LANDrop-<v>-windows-x86_64-setup.exe      Inno Setup 安装程序（可选加入 PATH）
+             LANDrop-<v>-windows-x86_64-portable.exe   单文件，双击即用（只有窗口）
+             LANDrop-<v>-windows-x86_64-portable.zip   解压即用，含窗口 + 命令行，数据存放在程序目录 data/
+    macOS    LANDrop-<v>-macos-<arch>-setup.pkg        装到 /Applications，并链接 /usr/local/bin/landrop
+             LANDrop-<v>-macos-<arch>-portable.dmg     打开即可运行（也可拖到任意位置），.app 内含命令行
+    Linux    LANDrop-<v>-linux-<arch>-setup.deb        /opt/landrop + /usr/bin/landrop(-gui) + 桌面菜单
+             LANDrop-<v>-linux-<arch>-portable.AppImage 单文件：不带参数打开窗口，带参数就是命令行
 
-每个产物都同时包含图形界面与命令行（同一份运行时）。
+除 Windows 单文件版外，每个产物都同时包含图形界面与命令行（同一份运行时）。
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ import shutil
 import stat
 import subprocess
 import sys
-import tarfile
+import urllib.request
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -97,6 +98,12 @@ def package_windows(out: str, arch: str) -> list[str]:
          f"/DOutputDir={os.path.abspath(out)}", f"/DOutputBase={base}",
          os.path.join(ROOT, "packaging", "windows", "landrop.iss")])
     produced.append(os.path.join(out, base + ".exe"))
+    onefile = os.path.join(DIST, "LANDrop-portable.exe")
+    if not os.path.isfile(onefile):
+        raise SystemExit(f"找不到 {onefile}（landrop.spec 在 Windows 上生成）")
+    single = os.path.join(out, artifact("windows", arch, "portable", ".exe"))
+    shutil.copy2(onefile, single)
+    produced.append(single)
     return produced
 
 
@@ -106,9 +113,18 @@ def package_macos(out: str, arch: str) -> list[str]:
     if not os.path.isdir(app):
         raise SystemExit(f"找不到 {app}，请先在 macOS 上运行 pyinstaller landrop.spec")
     produced = []
-    portable = os.path.join(out, artifact("macos", arch, "portable", ".zip"))
-    # ditto 保留 .app 里的符号链接、权限与签名；zipfile 会把框架链接摊平
-    run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", app, portable])
+    # 免安装版：dmg 里放 .app 与「应用程序」快捷方式；双击 .app 直接运行，也可拖进「应用程序」
+    stage = os.path.join(DIST, "dmgroot")
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(stage)
+    run(["ditto", app, os.path.join(stage, "LAN Drop.app")])
+    os.symlink("/Applications", os.path.join(stage, "Applications"))
+    portable = os.path.join(out, artifact("macos", arch, "portable", ".dmg"))
+    if os.path.exists(portable):
+        os.remove(portable)
+    run(["hdiutil", "create", "-volname", "LAN Drop", "-srcfolder", stage, "-fs", "HFS+",
+         "-format", "UDZO", "-ov", portable])
+    shutil.rmtree(stage, ignore_errors=True)
     produced.append(portable)
 
     work = os.path.join(DIST, "pkgwork")
@@ -154,23 +170,54 @@ StartupWMClass=Landrop
 """
 
 
-def _tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo:
-    info.uid = info.gid = 0
-    info.uname = info.gname = "root"
-    return info
+APPRUN = """#!/bin/sh
+# 不带参数（或 --smoke-test）打开窗口；带参数就是命令行：./LANDrop.AppImage send a.zip
+HERE="$(dirname "$(readlink -f "$0")")"
+if [ $# -eq 0 ] || [ "$1" = "--smoke-test" ] || [ "$1" = "--autostart" ]; then
+  exec "$HERE/usr/lib/landrop/landrop-gui" "$@"
+fi
+exec "$HERE/usr/lib/landrop/landrop" "$@"
+"""
+
+
+def appimagetool(arch: str) -> str:
+    """优先用环境变量 APPIMAGETOOL / PATH 里的；否则下载官方 appimagetool 到 dist/tools/。"""
+    found = os.environ.get("APPIMAGETOOL") or shutil.which("appimagetool")
+    if found:
+        return found
+    name = f"appimagetool-{'aarch64' if arch == 'arm64' else arch}.AppImage"
+    dest = os.path.join(DIST, "tools", name)
+    if not os.path.isfile(dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        url = f"https://github.com/AppImage/appimagetool/releases/download/continuous/{name}"
+        print(f"下载 {url}", flush=True)
+        urllib.request.urlretrieve(url, dest + ".tmp")
+        os.replace(dest + ".tmp", dest)
+    os.chmod(dest, 0o755)
+    return dest
+
+
+def package_appimage(out: str, arch: str) -> str:
+    appdir = os.path.join(DIST, "LANDrop.AppDir")
+    shutil.rmtree(appdir, ignore_errors=True)
+    shutil.copytree(BUNDLE, os.path.join(appdir, "usr", "lib", "landrop"), symlinks=True)
+    with open(os.path.join(appdir, "AppRun"), "w", encoding="utf-8") as f:
+        f.write(APPRUN)
+    os.chmod(os.path.join(appdir, "AppRun"), 0o755)
+    with open(os.path.join(appdir, "landrop.desktop"), "w", encoding="utf-8") as f:
+        f.write(DESKTOP_ENTRY.format(exec="landrop-gui"))
+    shutil.copy(os.path.join(ASSETS, "landrop.png"), os.path.join(appdir, "landrop.png"))
+    os.symlink("landrop.png", os.path.join(appdir, ".DirIcon"))
+    dest = os.path.join(out, artifact("linux", arch, "portable", ".AppImage"))
+    env = dict(os.environ, ARCH="aarch64" if arch == "arm64" else arch,
+               APPIMAGE_EXTRACT_AND_RUN="1")       # 构建机不一定有 FUSE
+    run([appimagetool(arch), "--no-appstream", appdir, dest], env=env)
+    shutil.rmtree(appdir, ignore_errors=True)
+    return dest
 
 
 def package_linux(out: str, arch: str) -> list[str]:
-    produced = []
-    portable = os.path.join(out, artifact("linux", arch, "portable", ".tar.gz"))
-    note = os.path.join(DIST, PORTABLE_MARKER)
-    with open(note, "w", encoding="utf-8") as f:
-        f.write(PORTABLE_NOTE)
-    with tarfile.open(portable, "w:gz") as tf:
-        tf.add(BUNDLE, "LANDrop", filter=_tar_filter)
-        tf.add(note, f"LANDrop/{PORTABLE_MARKER}", filter=_tar_filter)
-    os.remove(note)
-    produced.append(portable)
+    produced = [package_appimage(out, arch)]
 
     deb_arch = {"x86_64": "amd64", "arm64": "arm64"}.get(arch, arch)
     stage = os.path.join(DIST, "debroot")

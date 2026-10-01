@@ -85,11 +85,10 @@ jobs:
           xvfb-run -a python -u tests/package_check.py --cli landrop --gui landrop-gui
           sudo apt-get remove -y landrop
           test ! -e /usr/bin/landrop
-          mkdir -p "$RUNNER_TEMP/portable"
-          tar xzf out/*-portable.tar.gz -C "$RUNNER_TEMP/portable"
-          P="$RUNNER_TEMP/portable/LANDrop"
-          xvfb-run -a python -u tests/package_check.py --cli "$P/landrop" --gui "$P/landrop-gui" \
-            --expect-data-dir "$P/data"
+          # AppImage：runner 不一定有 FUSE，用解压运行模式；不带参数是窗口，带参数是命令行
+          A="$(ls "$PWD"/out/*-portable.AppImage)"
+          chmod +x "$A"
+          APPIMAGE_EXTRACT_AND_RUN=1 xvfb-run -a python -u tests/package_check.py --cli "$A" --gui "$A"
           python -m landrop --version
           if [ -f out/landrop.pyz ]; then python out/landrop.pyz --version; fi
 
@@ -114,6 +113,10 @@ jobs:
           $userPath = (Get-ItemProperty HKCU:\Environment).Path
           if ($userPath -like "*$dir*") { throw "uninstall did not clean PATH: $userPath" }
 
+          $single = (Get-ChildItem out\*-portable.exe | Select-Object -First 1).FullName
+          python -u tests/package_check.py --gui "$single"
+          if ($LASTEXITCODE -ne 0) { throw "package_check failed (single-file portable)" }
+
           $zip = (Get-ChildItem out\*-portable.zip | Select-Object -First 1).FullName
           Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP\portable"
           $p = "$env:RUNNER_TEMP\portable\LANDrop"
@@ -129,9 +132,12 @@ jobs:
           test -L /usr/local/bin/landrop
           python -u tests/package_check.py --cli /usr/local/bin/landrop \
             --gui "/Applications/LAN Drop.app/Contents/MacOS/LAN Drop"
-          mkdir -p "$RUNNER_TEMP/portable"
-          ditto -x -k out/*-portable.zip "$RUNNER_TEMP/portable"
-          python -u tests/package_check.py --cli "$RUNNER_TEMP/portable/LAN Drop.app/Contents/MacOS/landrop"
+          M="$RUNNER_TEMP/dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$M" out/*-portable.dmg
+          test -L "$M/Applications"
+          python -u tests/package_check.py --cli "$M/LAN Drop.app/Contents/MacOS/landrop" \
+            --gui "$M/LAN Drop.app/Contents/MacOS/LAN Drop"
+          hdiutil detach "$M"
 
       - uses: actions/upload-artifact@v4
         with:

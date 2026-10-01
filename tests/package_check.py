@@ -214,21 +214,22 @@ def check_gui(gui, tmp):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cli", required=True)
+    ap.add_argument("--cli", help="命令行可执行文件；省略则只测窗口（如 Windows 单文件版）")
     ap.add_argument("--gui")
     ap.add_argument("--expect-data-dir")
     args = ap.parse_args()
-    # 不带路径的名字（如 landrop）按 PATH 查找：仓库根目录下有同名的 landrop/ 包目录
-    cli = shutil.which(args.cli) if os.sep not in args.cli and "/" not in args.cli \
-        else (os.path.abspath(args.cli) if os.path.isfile(args.cli) else None)
-    if not cli:
-        print(f"找不到可执行文件：{args.cli}")
-        return 1
     tmp = tempfile.mkdtemp(prefix="landrop-pkg-")
-    src = make_payload(tmp)
-    check_version(cli)
-    check_direct(cli, tmp, src)
-    check_serve(cli, tmp, src, args.expect_data_dir and os.path.abspath(args.expect_data_dir))
+    if args.cli:
+        # 不带路径的名字（如 landrop）按 PATH 查找：仓库根目录下有同名的 landrop/ 包目录
+        cli = shutil.which(args.cli) if os.sep not in args.cli and "/" not in args.cli \
+            else (os.path.abspath(args.cli) if os.path.isfile(args.cli) else None)
+        if not cli:
+            print(f"找不到可执行文件：{args.cli}")
+            return 1
+        src = make_payload(tmp)
+        check_version(cli)
+        check_direct(cli, tmp, src)
+        check_serve(cli, tmp, src, args.expect_data_dir and os.path.abspath(args.expect_data_dir))
     if args.gui:
         gui = shutil.which(args.gui) if os.sep not in args.gui and "/" not in args.gui else args.gui
         check_gui(gui or args.gui, tmp)

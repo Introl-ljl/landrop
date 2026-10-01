@@ -11,6 +11,7 @@
     macOS     dist/LAN Drop.app/Contents/MacOS/LAN Drop（窗口）+ …/MacOS/landrop（命令行）
 
 所以安装一次就同时拥有图形界面与 ``landrop`` 命令，不再有单独的命令行安装包。
+Windows 另外生成单文件的 dist/LANDrop-portable.exe（只有窗口，免安装、无需解压）。
 """
 
 import os
@@ -59,6 +60,12 @@ exe_cli = EXE(PYZ(a_cli.pure), a_cli.scripts, [], exclude_binaries=True, name=CL
 # 两个可执行文件进同一个目录；COLLECT 会按目标路径去重共用的库
 coll = COLLECT(exe_gui, exe_cli, a_gui.binaries, a_gui.datas, a_cli.binaries, a_cli.datas,
                strip=False, upx=False, name="LANDrop")
+
+if IS_WIN:
+    # 免安装版（单文件）：双击即用、无需解压。Windows 程序只能二选一当窗口或控制台程序，
+    # 所以单文件版只有窗口；命令行在安装版与 zip 免安装版里。
+    EXE(PYZ(a_gui.pure), a_gui.scripts, a_gui.binaries, a_gui.datas, [], name="LANDrop-portable",
+        console=False, debug=False, strip=False, upx=False, icon=icon)
 
 if IS_MAC:
     # 第一个 EXE 是 .app 的主程序；命令行也在 Contents/MacOS/ 下，安装包会把它链接到 /usr/local/bin

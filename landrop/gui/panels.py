@@ -1366,7 +1366,8 @@ class SettingsPage(Page):
         info = W.frame(r3, bg="surface")
         info.pack(side="left", padx=(T.px(14), 0))
         W.label(info, f"LAN Drop {__version__}", size=12, weight="bold").pack(anchor="w")
-        kinds = {"portable": "免安装版", "installed": "安装版", "source": "源码运行"}
+        kinds = {"portable": "免安装版", "onefile": "免安装版（单文件）", "appimage": "免安装版（AppImage）",
+                 "installed": "安装版", "source": "源码运行"}
         W.label(info, f"{kinds[kind]} · 局域网文件互传与收集 · MIT 协议", role="muted", size=9).pack(anchor="w")
         W.Button(r3, "项目主页", lambda: system.open_url("https://github.com/Introl-ljl/landrop"),
                  kind="secondary", icon="external", size="sm").pack(side="right")
@@ -1378,7 +1379,7 @@ class SettingsPage(Page):
         st = system.cli_status()
         self._cli = st
         if not st["available"]:
-            self.cli_pill.set("源码运行", "muted")
+            self.cli_pill.set("单文件版不含" if system.is_onefile() else "源码运行", "muted")
             self.cli_state.configure(text=st["location"] or "python -m landrop")
             self.cli_btn.pack_forget()
         else:

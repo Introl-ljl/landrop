@@ -60,10 +60,25 @@ def default_download_dir() -> str:
 
 
 # --------------------------------------------------------------------------- 命令行工具
+def is_onefile() -> bool:
+    """Windows 单文件免安装版（PyInstaller onefile，运行时解压到 _MEIxxxx 临时目录）。"""
+    meipass = getattr(sys, "_MEIPASS", "")
+    return bool(meipass) and os.path.basename(meipass.rstrip("/\\")).startswith("_MEI")
+
+
+def appimage() -> str | None:
+    """Linux AppImage 免安装版：返回 .AppImage 文件本身的路径（带参数运行它就是命令行）。"""
+    path = os.environ.get("APPIMAGE")
+    return path if path and getattr(sys, "frozen", False) and os.path.isfile(path) else None
+
+
 def bundled_cli() -> str | None:
-    """打包版里与窗口同目录的命令行可执行文件；源码 / pyz 运行时为 None。"""
+    """打包版自带的命令行：与窗口同目录的 landrop(.exe)，AppImage 则是它自己；
+    源码 / pyz / 单文件版为 None。"""
+    if appimage():
+        return appimage()
     d = app_dir()
-    if not d:
+    if not d or is_onefile():
         return None
     path = os.path.join(d, "landrop.exe" if IS_WIN else "landrop")
     return path if os.path.isfile(path) else None
@@ -120,9 +135,11 @@ def cli_status() -> dict:
     cli = bundled_cli()
     found = shutil.which("landrop")
     if not cli:
+        note = ("单文件免安装版只包含图形界面（Windows 程序只能二选一当窗口或控制台程序）。"
+                "需要命令行请用安装版、zip 免安装版或 landrop.pyz。" if is_onefile() else
+                "当前从源码 / pyz 运行：命令行用法为 python -m landrop，或 pip install . 得到 landrop 命令。")
         return {"available": False, "installed": bool(found), "location": found or "",
-                "can_toggle": False,
-                "note": "当前从源码 / pyz 运行：命令行用法为 python -m landrop，或 pip install . 得到 landrop 命令。"}
+                "can_toggle": False, "note": note}
     d = os.path.dirname(cli)
     if _translocated(cli):
         return {"available": True, "installed": False, "location": "", "can_toggle": False,
@@ -217,7 +234,11 @@ def uninstall_cli() -> str:
 
 
 def install_kind() -> str:
-    """portable / installed / source —— 显示在「设置 · 关于」里。"""
+    """portable / onefile / appimage / installed / source —— 显示在「设置 · 关于」里。"""
     if portable_dir():
         return "portable"
+    if is_onefile():
+        return "onefile"
+    if appimage():
+        return "appimage"
     return "installed" if app_dir() else "source"
