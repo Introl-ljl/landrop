@@ -94,6 +94,14 @@ def _win_has(paths: str, d: str) -> bool:
                for p in paths.split(";") if p.strip())
 
 
+TRANSLOCATED = ("这个 LAN Drop.app 正从 macOS 的临时隔离位置运行（App Translocation），重启后路径会变。"
+                "请先把它拖到「应用程序」文件夹再打开，然后再链接命令行。")
+
+
+def _translocated(path: str | None) -> bool:
+    return bool(IS_MAC and path and "/AppTranslocation/" in path)
+
+
 def _link_target() -> str:
     if IS_MAC:
         return "/usr/local/bin/landrop"
@@ -116,6 +124,9 @@ def cli_status() -> dict:
                 "can_toggle": False,
                 "note": "当前从源码 / pyz 运行：命令行用法为 python -m landrop，或 pip install . 得到 landrop 命令。"}
     d = os.path.dirname(cli)
+    if _translocated(cli):
+        return {"available": True, "installed": False, "location": "", "can_toggle": False,
+                "note": TRANSLOCATED}
     if IS_WIN:
         user, system = _win_user_path(), _win_system_path()
         in_user, in_system = _win_has(user, d), _win_has(system, d)
@@ -154,6 +165,8 @@ def install_cli() -> str:
     cli = bundled_cli()
     if not cli:
         raise OSError("当前不是打包版，没有自带的命令行可执行文件")
+    if _translocated(cli):
+        raise OSError(TRANSLOCATED)
     if IS_WIN:
         import winreg
         d = os.path.dirname(cli)

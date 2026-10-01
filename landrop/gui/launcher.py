@@ -117,7 +117,7 @@ class LauncherApp:
         enable_dpi_awareness()
         self.settings = system.load_settings()
         T.set_mode(self.settings.get("theme", "system"))
-        self.root = tk.Tk(className="LANDrop")
+        self.root = tk.Tk(className="landrop")      # X11 WM_CLASS = ("landrop", "Landrop")，与 .desktop 的 StartupWMClass 对应
         T.init_tk(self.root)
         self.root.title("LAN Drop")
         self.root.configure(bg=T.c["bg"])

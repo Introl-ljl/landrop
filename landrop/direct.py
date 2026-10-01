@@ -321,7 +321,8 @@ class DirectSender:
                     return
                 if left == 0 and end >= size - 1:
                     sender.on_event(f"已发送：{entry['name']}  ({human(size)})")
-                    sender._mark_complete(sid, [entry["id"]])
+                    if start == 0:      # 只读文件尾（播放器探测 / 续传）不算整份送达；续传的 get 会调 /api/done
+                        sender._mark_complete(sid, [entry["id"]])
 
             def _zip(self, sid):
                 """全部文件打成一个 zip 边读边发（不落临时文件；存储模式，不压缩）。"""

@@ -840,7 +840,9 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     left -= len(chunk)
-        if left == 0 and end >= size - 1:       # 送到了最后一个字节：这个文件算「取完」
+        # 从第 0 字节一直送到最后一个字节才算「取完」：播放器探测文件尾（Range: bytes=N-）不算。
+        # 命令行跨会话断点续传只会下尾部，但它最后会调 /api/done，照样计数。
+        if left == 0 and start == 0 and end >= size - 1:
             self._note_complete(auth, row)
 
     @staticmethod

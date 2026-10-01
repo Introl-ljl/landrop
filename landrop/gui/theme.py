@@ -192,8 +192,8 @@ def enable_dpi_awareness():
         return
     try:
         import ctypes
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)       # 每显示器 DPI 感知
+        try:      # 系统级 DPI 感知（与 IDLE 相同）：按主显示器缩放、清晰；拖到不同缩放的副屏时由系统拉伸
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except (AttributeError, OSError):
             ctypes.windll.user32.SetProcessDPIAware()
     except Exception:  # noqa: BLE001

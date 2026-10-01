@@ -150,7 +150,7 @@ Icon=landrop
 Terminal=false
 Categories=Network;FileTransfer;Utility;
 Keywords=share;send;receive;transfer;lan;
-StartupWMClass=LAN Drop
+StartupWMClass=Landrop
 """
 
 
