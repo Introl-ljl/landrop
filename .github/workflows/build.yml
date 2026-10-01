@@ -34,10 +34,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          if (-not (Get-Command iscc -ErrorAction SilentlyContinue) -and
-              -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
-            choco install innosetup -y --no-progress
-          }
+          # 最新版 Inno Setup（7.0.2+ 自带简体中文界面）；失败时退回 runner 自带的版本
+          choco upgrade innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { Write-Warning "choco upgrade innosetup failed; using preinstalled" }
+          $global:LASTEXITCODE = 0
 
       - name: Build app bundle (GUI + CLI)
         run: pyinstaller --clean --noconfirm landrop.spec

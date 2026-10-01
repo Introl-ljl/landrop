@@ -75,14 +75,15 @@ def zip_dir(src: str, dest: str, arcroot: str, extra: dict | None = None):
 
 # --------------------------------------------------------------------------- Windows
 def find_iscc() -> str:
+    for ver in ("7", "6"):                 # 新版优先：7.0.2+ 自带简体中文界面
+        for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+                     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+            cand = os.path.join(base or "", f"Inno Setup {ver}", "ISCC.exe")
+            if os.path.isfile(cand):
+                return cand
     found = shutil.which("iscc") or shutil.which("ISCC")
     if found:
         return found
-    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
-                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
-        cand = os.path.join(base or "", "Inno Setup 6", "ISCC.exe")
-        if os.path.isfile(cand):
-            return cand
     raise SystemExit("找不到 Inno Setup（ISCC.exe）：choco install innosetup 或从 jrsoftware.org 安装")
 
 

@@ -51,9 +51,14 @@ CloseApplications=yes
 ShowLanguageDialog=auto
 LicenseFile=..\..\LICENSE
 
+; 简体中文界面需要 Inno Setup 7.0.2+（自带 ChineseSimplified.isl）；旧版编译器只生成英文界面
+#if FileExists(AddBackslash(CompilerPath) + "Languages\ChineseSimplified.isl")
+  #define HaveZh
+#endif
+
 [Languages]
 Name: "en"; MessagesFile: "compiler:Default.isl"
-#if FileExists(AddBackslash(CompilerPath) + "Languages\ChineseSimplified.isl")
+#ifdef HaveZh
 Name: "zh"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 #endif
 
@@ -63,11 +68,13 @@ en.DesktopIcon=Create a desktop shortcut
 en.Firewall=Allow LAN Drop through Windows Firewall (all users install only)
 en.Launch=Launch LAN Drop
 en.CliShortcut=LAN Drop Command Prompt
+#ifdef HaveZh
 zh.AddToPath=把 landrop 命令添加到 PATH（任意终端可直接使用命令行）
 zh.DesktopIcon=创建桌面快捷方式
 zh.Firewall=在 Windows 防火墙中允许 LAN Drop（仅「所有用户」安装时可用）
 zh.Launch=启动 LAN Drop
 zh.CliShortcut=LAN Drop 命令行
+#endif
 
 [Tasks]
 Name: "addtopath"; Description: "{cm:AddToPath}"
