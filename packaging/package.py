@@ -30,7 +30,7 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from landrop import __version__  # noqa: E402
-from landrop.common import PORTABLE_MARKER  # noqa: E402
+from landrop.common import PORTABLE_MARKER, setup_console  # noqa: E402
 
 DIST = os.path.join(ROOT, "dist")
 BUNDLE = os.path.join(DIST, "LANDrop")
@@ -234,6 +234,7 @@ def package_linux(out: str, arch: str) -> list[str]:
 
 
 def main(argv=None) -> int:
+    setup_console()             # Windows 控制台默认 cp1252 / GBK：中文输出会抛 UnicodeEncodeError
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", default=os.path.join(DIST, "release"))
     ap.add_argument("--arch", default=detect_arch())

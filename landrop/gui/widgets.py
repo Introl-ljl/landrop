@@ -420,7 +420,7 @@ class Button(Canvas):
                 fill, fg = mix(c["accent"], c["bg"], 0.55), mix(c["accent_ink"], c["bg"], 0.45)
         elif k == "danger":
             fill = c["danger"] if not (self._hover or self._press) else mix(c["danger"], "#000000", 0.12)
-            fg, line = "#ffffff", None
+            fg, line = ("#ffffff" if T.mode == "light" else "#1a0507"), None
             if disabled:
                 fill = mix(c["danger"], c["bg"], 0.55)
         elif k == "soft":
@@ -1045,7 +1045,9 @@ class Toast:
         tw = tkfont.Font(font=font).measure(text)
         ic = T.px(16)
         w, h = tw + ic + T.px(44), T.px(40)
-        bg = bg_of(self.root)
+        self.root.update_idletasks()
+        bg = visible_color_at(self.root, self.root.winfo_width() // 2 - w // 2 + 2,
+                              self.root.winfo_height() - T.px(24) - h // 2)
         fill = c["text"]
         fg = c["bg"]
         self.cv = tk.Canvas(self.root, width=w, height=h, bg=bg, highlightthickness=0, bd=0)
@@ -1055,7 +1057,7 @@ class Toast:
         self.cv.create_image(T.px(16), h // 2, image=icon_image(name, ic, col, fill), anchor="w")
         self.cv.create_text(T.px(16) + ic + T.px(10), h // 2, text=text, fill=fg, font=font, anchor="w")
         self.cv.place(relx=0.5, rely=1.0, y=-T.px(24), anchor="s")
-        self.cv.lift()
+        self.cv.tk.call("raise", self.cv._w)       # Canvas.lift 被重载成了 tag_raise
         self._job = self.root.after(ms, self.hide)
 
     def hide(self):
@@ -1065,6 +1067,107 @@ class Toast:
         if self.cv is not None:
             self.cv.destroy()
             self.cv = None
+
+
+class QRCode(Canvas):
+    """二维码：白底圆角块（深色主题下也保持白底，保证能扫）。"""
+
+    def __init__(self, parent, text="", size=168, **kw):
+        self.size = T.px(size)
+        super().__init__(parent, width=self.size, height=self.size, **kw)
+        self.text = text
+        self.draw()
+
+    def set(self, text: str):
+        self.text = text
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        bg = bg_of(self.master)
+        self.configure(bg=bg)
+        s = self.size
+        rounded(self, 0, 0, s, s, T.px(14), "#ffffff", T.c["line"], max(1, T.px(1)), bg)
+        if not self.text:
+            return
+        from landrop.qr import encode
+        try:
+            m = encode(self.text, "M")
+        except ValueError:
+            return
+        n = len(m)
+        cell = max(1, (s - T.px(20)) // n)
+        off = (s - cell * n) // 2
+        for y, row in enumerate(m):
+            x = 0
+            while x < n:                       # 同一行连续的深色模块合并成一个矩形
+                if row[x]:
+                    x1 = x
+                    while x1 < n and row[x1]:
+                        x1 += 1
+                    self.create_rectangle(off + x * cell, off + y * cell, off + x1 * cell,
+                                          off + (y + 1) * cell, fill="#111318", width=0)
+                    x = x1
+                else:
+                    x += 1
+
+    def recolor(self):
+        self.draw()
+
+
+class Check(Canvas):
+    """复选框（圆角方块 + 对勾）。"""
+
+    def __init__(self, parent, variable: tk.BooleanVar, command=None, **kw):
+        self.var, self.command = variable, command
+        self._s = T.px(18)
+        super().__init__(parent, width=self._s, height=self._s, cursor="hand2", **kw)
+        self.bind("<Button-1>", self._toggle)
+        variable.trace_add("write", lambda *a: self.draw())
+        self.draw()
+
+    def _toggle(self, _e=None):
+        self.var.set(not self.var.get())
+        if self.command:
+            self.command()
+
+    def draw(self):
+        self.delete("all")
+        c = T.c
+        bg = bg_of(self.master)
+        self.configure(bg=bg)
+        s = self._s
+        if self.var.get():
+            rounded(self, 0, 0, s, s, T.px(5), c["accent"], None, 1, bg)
+            self.create_image(s // 2, s // 2, image=icon_image("check", T.px(14), c["accent_ink"], c["accent"],
+                                                                stroke=3))
+        else:
+            rounded(self, 0, 0, s, s, T.px(5), c["surface"], c["line2"], max(1, T.px(1.5)), bg)
+
+    def recolor(self):
+        self.draw()
+
+
+def elide(text: str, limit: int = 56) -> str:
+    """过长的文件名从中间省略，保留扩展名。"""
+    if len(text) <= limit:
+        return text
+    keep = limit - 1
+    return text[:keep - keep // 3] + "…" + text[-(keep // 3):]
+
+
+def visible_color_at(root, x, y) -> str:
+    """窗口内某点实际看到的颜色：自绘卡片 / 按钮画的是圆角块，背景色并不是它的 bg 属性。"""
+    w = root.winfo_containing(root.winfo_rootx() + x, root.winfo_rooty() + y)
+    while w is not None:
+        role = getattr(w, "fill_role", None)
+        if role:
+            return T.c[role]
+        roles = getattr(w, "_roles", None)
+        if roles and roles.get("bg"):
+            return T.c[roles["bg"]]
+        w = w.master
+    return T.c["bg"]
 
 
 def hline(parent, bg_role="line", pady=0):

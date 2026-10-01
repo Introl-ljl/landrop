@@ -6,7 +6,7 @@
     landrop serve [--data-dir …]   在本机启动收集服务（网页 + CLI）
     landrop send --server URL …    上传到常驻服务，生成一次性取件码
     landrop revoke <ID>            撤销一个传输/分享
-    landrop gui                    桌面窗口（Windows / macOS）
+    landrop gui                    打开桌面窗口（与安装包里的 LAN Drop 是同一个程序）
 """
 from __future__ import annotations
 
@@ -77,6 +77,20 @@ def expand_paths(items: list[str]) -> list[str]:
     return out
 
 
+def print_code(code: str, qr: bool = False):
+    """send 的输出：文件码、取件命令、浏览器网址（窗口里的发送页显示的是同样三样）。"""
+    url = code if code.startswith(("http://", "https://")) else "http://" + code
+    print(f"文件码:  {code}")
+    print(f"取件命令: {cmd_prefix()} get {code}")
+    print("          （加 -o <目录> 指定保存位置，默认保存到运行命令时所在目录）")
+    print(f"浏览器:  {url}   （手机 / 没装 LAN Drop 的设备直接打开即可下载）")
+    if qr:
+        from .qr import encode, to_terminal
+        print()
+        print(to_terminal(encode(url)))
+        print("          手机扫码下载")
+
+
 def cmd_send_via_server(args) -> int:
     paths = expand_paths(args.files or pick_interactively())
     entries = collect_entries(paths)
@@ -100,9 +114,7 @@ def cmd_send_via_server(args) -> int:
         return 130
     progress_end()
     print()
-    print(f"文件码:  {res['code']}")
-    print(f"取件命令: {res['command']}")
-    print("          （加 -o <目录> 指定保存位置，默认保存到运行命令时所在目录）")
+    print_code(res["code"], args.qr)
     exp = f"{args.expire:g} 小时后过期" if args.expire else "永不过期"
     times = f"可取 {args.max_downloads} 次" if args.max_downloads else "取件次数不限"
     print(f"共 {res['count']} 个文件，{human(res['bytes'])}，{exp}，{times}；"
@@ -124,9 +136,7 @@ def cmd_send(args) -> int:
     ips = [args.ip] if args.ip else lan_addresses()
     code = make_code(f"http://{ips[0]}:{sender.port}", sender.token)
     print()
-    print(f"文件码:  {code}")
-    print(f"取件命令: {cmd_prefix()} get {code}")
-    print("          （加 -o <目录> 指定保存位置，默认保存到运行命令时所在目录）")
+    print_code(code, args.qr)
     if len(ips) > 1 and not args.ip:
         print("          其他可用地址（若上面的对方连不上，换一个 IP 再试）：" +
               "  ".join(f"{ip}:{sender.port}" for ip in ips[1:]))
@@ -195,7 +205,7 @@ def cmd_gui(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="landrop", description="LAN Drop：局域网文件互传与收集")
     p.add_argument("--version", action="version", version=f"landrop {__version__}")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd", metavar="命令")
 
     s = sub.add_parser("send", help="直连发送：生成文件码并等待对方 get（无需服务）；--server 则上传到常驻服务")
     s.add_argument("files", nargs="*", help="文件或目录（可用通配符）；省略则交互选择")
@@ -213,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-downloads", type=int, default=1, metavar="N",
                    help="--server 模式：最多被完整取件几次，0 表示不限（默认 1，即一次性）")
     s.add_argument("--label", help="这批文件的备注（默认用文件名）")
+    s.add_argument("--qr", action="store_true", help="在终端里显示二维码（手机扫码用浏览器下载）")
     s.set_defaults(fn=cmd_send)
 
     g = sub.add_parser("get", help="用文件码把文件下载到当前目录（或 -o 指定目录）")
@@ -226,8 +237,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("serve", help="在本机启动收集服务（网页 + CLI；参数见 landrop serve --help）",
                    add_help=False)
 
-    gui = sub.add_parser("gui", help="打开桌面窗口（Windows / macOS）")
-    gui.add_argument("--autostart", action="store_true", help="打开后立即启动服务")
+    gui = sub.add_parser("gui", help="打开桌面窗口")
+    gui.add_argument("--autostart", action="store_true", help="打开后立即启动收集服务")
     gui.set_defaults(fn=cmd_gui)
 
     r = sub.add_parser("revoke", help="撤销一个文件码（需要管理员密钥）")
@@ -239,6 +250,18 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _pause_if_double_clicked():
+    """Windows 上在资源管理器里双击 landrop.exe：控制台窗口一闪而过。只有本进程用这个控制台时停一下。"""
+    if not sys.platform.startswith("win") or not sys.stdin or not sys.stdin.isatty():
+        return
+    try:
+        import ctypes
+        if ctypes.windll.kernel32.GetConsoleProcessList((ctypes.c_uint * 2)(), 2) <= 1:
+            input("这是命令行工具，请在终端里使用；想要图形界面请打开 LAN Drop。按回车键关闭…")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main(argv=None) -> int:
     setup_console()
     argv = sys.argv[1:] if argv is None else list(argv)
@@ -248,7 +271,13 @@ def main(argv=None) -> int:
         except CliError as exc:
             print(f"错误：{exc}", file=sys.stderr)
             return 1
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "fn", None):        # 不带命令：给出用法，而不是一行报错
+        parser.print_help()
+        print(f"\n例：{cmd_prefix()} send a.zip    {cmd_prefix()} get <文件码>    {cmd_prefix()} gui")
+        _pause_if_double_clicked()
+        return 0
     try:
         return args.fn(args)
     except CliError as exc:

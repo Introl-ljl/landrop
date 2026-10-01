@@ -1,4 +1,4 @@
-; LAN Drop Windows 安装程序（Inno Setup 6）。由 packaging/package.py 调用：
+﻿; LAN Drop Windows 安装程序（Inno Setup 6）。由 packaging/package.py 调用：
 ;   iscc /DAppVersion=0.3.0 /DSourceDir=dist\LANDrop /DOutputDir=out /DOutputBase=LANDrop-0.3.0-windows-x86_64-setup landrop.iss
 ;
 ; * 默认按当前用户安装（不需要管理员）；安装时可切换为所有用户。
@@ -49,17 +49,24 @@ WizardStyle=modern
 ChangesEnvironment=yes
 CloseApplications=yes
 ShowLanguageDialog=auto
+LanguageDetectionMethod=uilanguage
 LicenseFile=..\..\LICENSE
 
-; 简体中文界面需要 Inno Setup 7.0.2+（自带 ChineseSimplified.isl）；旧版编译器只生成英文界面
+; 简体中文界面：Inno Setup 7.0.2+ 自带官方译文；6.5–6.x 用同目录下随附的译文
+; （ChineseSimplified.isl，取自 jrsoftware/issrc 的 is-6_7_1 标签，Inno Setup 许可证）
 #if FileExists(AddBackslash(CompilerPath) + "Languages\ChineseSimplified.isl")
+  #define ZhIsl "compiler:Languages\ChineseSimplified.isl"
+#elif Ver >= EncodeVer(6, 5, 0)
+  #define ZhIsl "ChineseSimplified.isl"
+#endif
+#ifdef ZhIsl
   #define HaveZh
 #endif
 
 [Languages]
 Name: "en"; MessagesFile: "compiler:Default.isl"
 #ifdef HaveZh
-Name: "zh"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "zh"; MessagesFile: "{#ZhIsl}"
 #endif
 
 [CustomMessages]

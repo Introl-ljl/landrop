@@ -35,7 +35,7 @@ for base, dirs, files in os.walk(STATIC):
 
 hidden = ["landrop.server.app", "landrop.server.store", "landrop.gui.launcher",
           "landrop.gui.panels", "landrop.gui.theme", "landrop.gui.widgets", "landrop.gui.icon",
-          "landrop.gui.system"]
+          "landrop.gui.system", "landrop.gui.windrop", "landrop.qr"]
 excludes = ["numpy", "PIL", "pytest", "setuptools", "pip"]
 icon = os.path.join(ASSETS, "landrop.ico" if IS_WIN else "landrop.icns")
 
