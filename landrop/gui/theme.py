@@ -139,6 +139,9 @@ class Theme:
         self.mono = _first(families, _MONO_FONTS) or tkfont.nametofont("TkFixedFont").actual("family")
 
     def font(self, size: int = 10, weight: str = "normal", mono: bool = False):
+        # 字号按 Windows / Linux 调（Tk 缩放 ≈ 1.33，10 磅 ≈ 13 像素）；macOS 的 Tk 缩放是 1.0，放大 4/3 才一样大
+        if sys.platform == "darwin":
+            size = round(size * 4 / 3)
         return (self.mono if mono else self.family, size, weight)
 
 

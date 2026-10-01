@@ -935,10 +935,8 @@ class ScrollFrame(tk.Frame, Themed):
         self.canvas.pack(side="left", fill="both", expand=True)
         self.body.bind("<Configure>", self._on_body)
         self.canvas.bind("<Configure>", self._on_canvas)
-        self.canvas.configure(yscrollcommand=self.bar.set)
-        for w in (self.canvas, self.body):
-            w.bind("<Enter>", self._bind_wheel)
-            w.bind("<Leave>", self._unbind_wheel)
+        self.canvas.configure(yscrollcommand=self.bar.set, yscrollincrement=T.px(20))
+        ScrollFrame._install_wheel(self.winfo_toplevel())
 
     def _on_body(self, _e=None):
         self.canvas.configure(scrollregion=(0, 0, self.body.winfo_reqwidth(), self.body.winfo_reqheight()))
@@ -956,26 +954,47 @@ class ScrollFrame(tk.Frame, Themed):
             self.bar.place_forget()
             self.canvas.yview_moveto(0)
 
-    def _bind_wheel(self, _e=None):
-        self.canvas.bind_all("<MouseWheel>", self._wheel)
-        self.canvas.bind_all("<Button-4>", lambda e: self._scroll(-3))
-        self.canvas.bind_all("<Button-5>", lambda e: self._scroll(3))
+    _wheel_installed: set = set()
 
-    def _unbind_wheel(self, _e=None):
-        self.canvas.unbind_all("<MouseWheel>")
-        self.canvas.unbind_all("<Button-4>")
-        self.canvas.unbind_all("<Button-5>")
-
-    def _wheel(self, e):
+    @classmethod
+    def _install_wheel(cls, top):
+        """全局只装一次：滚轮滚动指针下方的那个 ScrollFrame（指针在卡片、按钮上也有效）。"""
+        if str(top) in cls._wheel_installed:
+            return
+        cls._wheel_installed.add(str(top))
         import sys
-        delta = -e.delta if sys.platform == "darwin" else -e.delta // 40
-        self._scroll(delta)
+
+        def target(e):
+            w = top.winfo_containing(e.x_root, e.y_root)
+            while w is not None:
+                if isinstance(w, tk.Text):        # 日志框自己滚
+                    return None
+                if isinstance(w, ScrollFrame):
+                    return w
+                w = w.master
+            return None
+
+        def wheel(e):
+            sf = target(e)
+            if sf is not None:
+                d = -e.delta if sys.platform == "darwin" else -e.delta / 40
+                sf._scroll(round(d) or (1 if d > 0 else -1))
+
+        top.bind_all("<MouseWheel>", wheel, add="+")
+        top.bind_all("<Button-4>", lambda e: (target(e) or _Nil)._scroll(-3), add="+")
+        top.bind_all("<Button-5>", lambda e: (target(e) or _Nil)._scroll(3), add="+")
 
     def _scroll(self, units):
         if self.body.winfo_reqheight() > self.canvas.winfo_height():
             self.canvas.yview_scroll(int(units), "units")
 
     def recolor(self):
+        pass
+
+
+class _Nil:
+    @staticmethod
+    def _scroll(_units):
         pass
 
 

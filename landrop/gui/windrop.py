@@ -54,7 +54,8 @@ def _files(hdrop) -> list[str]:
 
 
 def enable(root, callback):
-    """让 root 窗口接受拖放；callback(paths) 在 Tk 主循环里被调用。"""
+    """让 root 窗口接受拖放。callback(paths) 在窗口过程里被调用，必须是线程安全、不碰 tkinter 的函数
+    （比如往 queue.Queue 里放东西，由 Tk 主循环轮询处理）。"""
     root.update_idletasks()
     targets = [root.winfo_id()]
     parent = _user32.GetParent(root.winfo_id())
@@ -76,7 +77,9 @@ def enable(root, callback):
                 finally:
                     _shell32.DragFinish(wparam)
                 if paths:
-                    root.after(0, lambda p=paths: callback(p))
+                    # 这里正处在 Tcl 分发消息的过程中：绝不能调用任何 tkinter 接口（包括 after），
+                    # 否则会打乱 _tkinter 保存的线程状态，直接 Fatal Python error。只把路径交给线程安全的队列。
+                    callback(paths)
                 return 0
             return _user32.CallWindowProcW(old[0], h, msg, wparam, lparam)
 

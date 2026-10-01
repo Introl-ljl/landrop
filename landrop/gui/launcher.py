@@ -271,7 +271,7 @@ class LauncherApp:
             return
         try:
             from . import windrop
-            windrop.enable(self.root, self._dropped)
+            windrop.enable(self.root, lambda paths: self.bridge.call(self._dropped, paths))
             self.send.drop_hint.configure(text="把文件或文件夹拖进窗口，或点下面的按钮选择")
         except Exception:  # noqa: BLE001
             traceback.print_exc()

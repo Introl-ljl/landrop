@@ -49,6 +49,21 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
           xvfb-run -a python -u tests/gui_check.py
 
+      - name: GUI screenshots (for review; Pillow is only used here)
+        continue-on-error: true
+        shell: bash
+        run: |
+          python -m pip install pillow
+          if [ "$RUNNER_OS" = "Linux" ]; then xvfb-run -a -s "-screen 0 1280x900x24" python tests/gui_screenshots.py shots
+          else python tests/gui_screenshots.py shots; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: screenshots-${{ matrix.target }}
+          path: shots/*.png
+          if-no-files-found: ignore
+
       - name: Build app bundle (GUI + CLI)
         run: pyinstaller --clean --noconfirm landrop.spec
 
