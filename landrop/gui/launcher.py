@@ -122,8 +122,11 @@ class LauncherApp:
         self.root.title("LAN Drop")
         self.root.configure(bg=T.c["bg"])
         self.root._roles = {"bg": "bg"}
-        self.root.minsize(T.px(880), T.px(600))
-        self.root.geometry(f"{T.px(1040)}x{T.px(720)}")
+        # 初始大小不超过屏幕（小屏 / 高缩放下 1040×720 可能放不下），并居中
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        w, h = min(T.px(1040), sw - T.px(40)), min(T.px(720), sh - T.px(90))
+        self.root.minsize(min(T.px(880), w), min(T.px(600), h))
+        self.root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
         self._logos = {}
         self._set_icon()
         self.busy: dict[str, bool] = {}

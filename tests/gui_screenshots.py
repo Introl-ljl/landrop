@@ -60,7 +60,7 @@ def one(mode, out):
         kw = {"xdisplay": os.environ["DISPLAY"]} if sys.platform.startswith("linux") else {}
         ImageGrab.grab(bbox=(x, y, x + w, y + h), **kw).save(os.path.join(out, f"{sys.platform}-{mode}-{name}.png"))
 
-    app.root.geometry("+40+40")
+    app.root.geometry("+0+0")
     pump(1.2)
     shot("1-send")
     app.send.add_paths([os.path.join(src, n) for n in sorted(os.listdir(src))])

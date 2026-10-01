@@ -73,4 +73,7 @@ if IS_MAC:
                      "LSMinimumSystemVersion": "11.0",
                      "NSRequiresAquaSystemAppearance": False,
                      "LSApplicationCategoryType": "public.app-category.utilities",
+                     # macOS 15+ 访问局域网前会弹窗询问，这句话会显示在弹窗里
+                     "NSLocalNetworkUsageDescription":
+                         "LAN Drop 需要访问局域网，才能在设备之间直接发送和接收文件。",
                  })
