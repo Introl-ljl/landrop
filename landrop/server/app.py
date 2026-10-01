@@ -1207,8 +1207,17 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+_janitor_started = False
+
+
 def _start_janitor(interval: float = 60.0):
-    """后台清理：过期会话与失效的一次性传输（连磁盘文件一起删）。"""
+    """后台清理：过期会话与失效的一次性传输（连磁盘文件一起删）。
+    进程内只启动一个：桌面窗口反复启停服务时不会越积越多（它总是清理当前的 STORE）。"""
+    global _janitor_started
+    if _janitor_started:
+        return
+    _janitor_started = True
+
     def loop():
         while True:
             time.sleep(interval)
