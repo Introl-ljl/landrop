@@ -1,0 +1,8 @@
+#!/bin/sh
+# macOS 安装包的安装后脚本：把 .app 里自带的命令行链接到 /usr/local/bin，终端里即可直接用 landrop。
+APP="${2:-/}"
+APP="${APP%/}/Applications/LAN Drop.app"
+[ -d "$APP" ] || APP="/Applications/LAN Drop.app"
+mkdir -p /usr/local/bin
+ln -sf "$APP/Contents/MacOS/landrop" /usr/local/bin/landrop
+exit 0

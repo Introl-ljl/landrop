@@ -9,7 +9,9 @@
 **(1)** direct peer-to-peer transfer with a file code — `landrop send a.zip` prints a code, the receiver runs
 `landrop get <code>`; no server needed; **(2)** `landrop serve` turns your machine into a collection server
 (web UI + CLI, per-link permissions, SHA-256 verification, resumable uploads); **(3)** run that server long-term
-(Docker) and use it as a central hub with one-shot, auto-expiring transfers. GUI for Windows/macOS, CLI for Linux. MIT.
+(Docker) and use it as a central hub with one-shot, auto-expiring transfers. One app per platform
+(Windows / macOS / Linux) with a desktop window **and** the `landrop` command, shipped as an installer and a
+portable build. A file code is also a URL, so phones can receive with just a browser (or by scanning a QR code). MIT.
 
 ## 你想做什么？
 
@@ -21,20 +23,44 @@
 
 ## 下载 / 安装
 
-到 [Releases](https://github.com/Introl-ljl/landrop/releases) 下载（含 `SHA256SUMS`）：
+到 [Releases](https://github.com/Introl-ljl/landrop/releases) 下载（含 `SHA256SUMS`）。每个平台都有**安装版**和**免安装版**，
+每个文件都是单独的附件，下载即可用：**桌面窗口 + `landrop` 命令行**共用一份运行时，不再有单独的命令行安装包。
 
-| 平台 | 文件 |
-| --- | --- |
-| Windows x64 | `landrop-gui-windows-x86_64.exe`（窗口）、`landrop-windows-x86_64.exe`（命令行） |
-| macOS（Apple 芯片 / Intel） | `landrop-gui-macos-arm64` / `landrop-gui-macos-x86_64`（窗口）、`landrop-macos-*`（命令行） |
-| Linux x64 / arm64 | `landrop-linux-*`（命令行，含 `serve`；Linux 只提供命令行） |
-| 任意装了 Python 3.8+ 的系统 | `landrop.pyz`（单文件，`python3 landrop.pyz send …`） |
-| Docker | `docker pull ghcr.io/introl-ljl/landrop:latest` |
-| 从源码 | `git clone … && python3 -m landrop --help`，或 `pip install .` 得到 `landrop` 命令 |
+| 平台 | 安装版 | 免安装版（无需安装、无需解压） |
+| --- | --- | --- |
+| Windows x64 | `LANDrop-<版本>-windows-x86_64-setup.exe` | `LANDrop-<版本>-windows-x86_64-portable.exe`（单文件，只有窗口）<br>`LANDrop-<版本>-windows-x86_64-portable.zip`（需解压，含命令行，数据跟着程序目录） |
+| macOS Apple 芯片 | `LANDrop-<版本>-macos-arm64-setup.pkg` | `LANDrop-<版本>-macos-arm64-portable.dmg` |
+| macOS Intel | `LANDrop-<版本>-macos-x86_64-setup.pkg` | `LANDrop-<版本>-macos-x86_64-portable.dmg` |
+| Linux x64 / arm64 | `LANDrop-<版本>-linux-<架构>-setup.deb` | `LANDrop-<版本>-linux-<架构>-portable.AppImage` |
 
-> macOS 二进制未签名：首次运行请在「系统设置 → 隐私与安全性」允许，或 `xattr -d com.apple.quarantine <文件>`。
-> Windows 可能出现 SmartScreen 提示，选择「仍要运行」。下文命令里的 `landrop` 在不同形态下等价于
-> `python3 -m landrop`（源码）、`python3 landrop.pyz`（pyz）或二进制文件名。
+| 形态 | 装了什么 | 命令行在哪 | 数据在哪 |
+| --- | --- | --- | --- |
+| Windows 安装版 | 开始菜单「LAN Drop」「LAN Drop 命令行」；默认装到当前用户，不需要管理员 | 勾选「添加到 PATH」（默认勾选）后任意终端可用 `landrop`；卸载时自动移除 | `%APPDATA%\LANDrop` |
+| macOS 安装版 | `/Applications/LAN Drop.app` | 安装时自动链接 `/usr/local/bin/landrop` | `~/Library/Application Support/LANDrop` |
+| Linux 安装版（.deb） | `/opt/landrop`，应用菜单里的「LAN Drop」 | `/usr/bin/landrop`（窗口：`landrop-gui`） | `~/.local/share/landrop` |
+| Windows 单文件版 `portable.exe` | 双击即用 | 不含（Windows 程序只能二选一当窗口或控制台程序）；命令行用安装版、zip 版或 pyz | 同安装版 |
+| Windows zip 版 | 解压即用：`LAN Drop.exe` 与 `landrop.exe` 在同一目录 | 直接运行目录里的 `landrop.exe`，或在窗口「设置 → 命令行工具」一键加入 PATH | **程序目录下的 `data/`**，整个文件夹可拷走（删掉 `portable.txt` 则改用系统目录） |
+| macOS `portable.dmg` | 打开后双击 `LAN Drop.app` 直接运行，或拖到任意位置 | `LAN Drop.app/Contents/MacOS/landrop`，或「设置 → 命令行工具」一键链接 | 同安装版（`.app` 内部不可写） |
+| Linux `portable.AppImage` | `chmod +x` 后运行：不带参数打开窗口 | 带参数运行它就是命令行（`./LANDrop-….AppImage send a.zip`），或「设置 → 命令行工具」链接到 `~/.local/bin/landrop` | 同安装版 |
+| 任意装了 Python 3.8+ 的系统 | `landrop.pyz` 单文件 | `python3 landrop.pyz send …` | 同上表各平台默认目录 |
+| Docker | `docker pull ghcr.io/introl-ljl/landrop:latest`（收集服务） | — | 挂载的 `/data` |
+| 从源码 | `git clone …` 后 `python3 -m landrop`，或 `pip install .` 得到 `landrop` 与 `landrop-gui` | | |
+
+> 二进制未签名：macOS 首次打开请右键「打开」，或在「系统设置 → 隐私与安全性」允许；Windows 可能出现 SmartScreen，
+> 选择「更多信息 → 仍要运行」。静默安装：`setup.exe /VERYSILENT /CURRENTUSER /TASKS=addtopath`。
+> 下文命令里的 `landrop` 在不同形态下等价于 `python3 -m landrop`（源码）、`python3 landrop.pyz`（pyz）。
+
+### 桌面窗口
+
+左侧导航四个页面，浅色 / 深色跟随系统，配色与网页一致：
+
+- **发送**：选择（Windows 上也可以直接拖入）文件或文件夹 → 选「直连」或「经服务器」→ 生成文件码。
+  结果页同时给出**文件码**、**取件命令**、**浏览器网址**和**二维码**：装了 LAN Drop 的电脑粘贴文件码，
+  手机扫码就能在浏览器里下载。直连可设置等待时长、接收者数量、写进文件码的网卡地址（多网卡 / VPN）。
+- **接收**：粘贴文件码（剪贴板里有文件码时自动填入）→ 可以「先看看有哪些文件」再勾选 → 接收；
+  逐个校验 SHA-256，中断后重新接收自动续传，显示速度与最近接收记录。
+- **收集服务**：一个开关启动 / 停止；显示访问地址、二维码、管理员密钥；「打开管理面板」免输入密钥直接登录；可看服务日志。
+- **设置**：外观、命令行工具（加入 / 移出 PATH）、数据目录、版本信息。
 
 ---
 
@@ -61,9 +87,12 @@ landrop get <文件码> --only a.zip -f              # 只取某个文件；同�
 
 - **校验与续传**：发送端先算 SHA-256，接收端逐个校验，失败不落盘；下载中断后重新运行 `get` 会从 `.part` 断点继续。
 - **文件夹**：保留目录结构；接收端逐段清洗路径，拒绝 `..`。
-- **选项**：`--receivers N`（允许 N 个接收者取完后退出）、`--timeout 分钟`、`--port`、`--ip`（多网卡/VPN 时指定写进文件码的地址）。
-- **Windows / macOS 图形界面**：打开 `landrop-gui`（或 `landrop gui`）→「发送文件」页添加文件/文件夹 → 生成文件码并一键复制；
-  对方在「接收文件」页粘贴文件码（整条命令也行）即可。发送期间保持窗口打开。
+- **选项**：`--receivers N`（允许 N 个接收者取完后退出）、`--timeout 分钟`、`--port`、`--ip`（多网卡/VPN 时指定写进文件码的地址）、
+  `--qr`（在终端里打印二维码）。
+- **文件码就是网址**：`http://<文件码>` 用浏览器打开即可看到文件列表并下载（多个文件可「全部下载」为 zip），
+  适合手机或没装 LAN Drop 的电脑；浏览器把文件都下载完也算一次取件，发送端随之结束。
+- **桌面窗口**：「发送」页添加文件/文件夹 → 生成文件码并一键复制或扫码；对方在「接收」页粘贴文件码（整条命令也行）即可。
+  发送期间保持窗口打开。
 - **注意**：传输是明文 HTTP，仅限可信局域网；首次监听系统防火墙会弹窗，请选「允许访问」。
 
 ---
@@ -79,13 +108,15 @@ landrop get <文件码> --only a.zip -f              # 只取某个文件；同�
 - 每次投递都拿到服务端实算的 SHA-256 回执，核对「收到的」与「发出的」是否一致。
 
 ```bash
-landrop serve --data-dir ./data                       # 启动，终端打印访问地址与管理员密钥
-landrop serve --data-dir ./data --dir /mnt/disk/毕业照 --space 毕业照   # 收集到指定磁盘目录
-landrop serve --data-dir ./data --import ./uploads --import-recursive  # 导入历史文件（复制+校验）
-landrop gui                                           # Windows/macOS：窗口里点「收集服务」→ 启动
+landrop serve                                         # 启动，终端打印访问地址与管理员密钥
+landrop serve --dir /mnt/disk/毕业照 --space 毕业照      # 收集到指定磁盘目录
+landrop serve --import ./uploads --import-recursive   # 导入历史文件（复制+校验）
+landrop serve --data-dir ./data                       # 指定数据目录（默认与桌面窗口相同，见「下载 / 安装」）
+landrop gui                                           # 或者打开窗口 →「收集服务」→ 打开开关
 ```
 
-用管理员密钥打开 `/admin` 创建分享链接，把链接发给大家；可随时撤销或轮换。
+用管理员密钥打开 `/admin` 创建分享链接，把链接发给大家；可随时撤销或轮换（桌面窗口里点「打开管理面板」会自动登录）。
+命令行与窗口**共用同一个数据目录**，所以在哪边启动，链接、文件和管理员密钥都是同一套。
 
 **同样支持命令行操作**（网页能做的核心动作 CLI 都能做）：
 
@@ -95,7 +126,8 @@ landrop get  <文件码> -o ./out                                          # 用
 landrop revoke <授权ID> --server … --key …                              # 撤销
 ```
 
-`--key` 也可用环境变量 `LANDROP_ADMIN_KEY`；本机运行时会自动读取 `--data-dir` 里的 `admin-key.txt`。
+`--key` 也可用环境变量 `LANDROP_ADMIN_KEY`；本机运行时会自动读取数据目录里的 `admin-key.txt`。
+文件夹也可以经服务器发送（保留目录结构）。经服务器生成的文件码同样可以直接用浏览器打开取件。
 
 ---
 
@@ -111,8 +143,8 @@ docker compose logs | grep -E "访问地址|管理员密钥"
 ```
 
 - **一次性传输**：`landrop send a.zip --server URL --key KEY [--expire 小时] [--max-downloads N]`
-  会在服务端建一个临时传输（默认 24 小时内有效、取 1 次即失效），不会留下空间和授权；
-  到期 / 取够次数 / 被撤销后，后台清理任务连同磁盘文件一起删除。
+  （或窗口里「经服务器」发送）会在服务端建一个临时传输（默认 24 小时内有效、取 1 次即失效），不会留下空间和授权；
+  到期 / 取够次数 / 被撤销后，后台清理任务连同磁盘文件一起删除。管理面板的「一次性传输」里可以查看与撤销。
 - **给没装任何东西的电脑**：服务起来后访问 `http://<地址>/downloads/landrop.pyz` 即可下载单文件客户端。
 - **升级**：数据目录原样可用（数据库迁移只增不改）。旧版只有 `uploads/` 的话，用 `--import` 导入，**不要**直接删除旧目录。
 - `LANDROP_PUBLIC_URL` 必须设为宿主机局域网地址，否则分享链接与文件码里是 Docker 内网地址、别人连不上。
@@ -126,6 +158,7 @@ docker compose logs | grep -E "访问地址|管理员密钥"
 | 权限档 | 能看到已有文件 | 下载 | 删除 | 说明 |
 | --- | --- | --- | --- | --- |
 | `仅上传` | ✗ | ✗ | ✗ | 投递箱：上传后只拿到自己的回执，看不到空间内容 |
+| `仅下载` | ✓ | ✓ | ✗ | 只能取件，不能上传（一次性传输就是这一档） |
 | `可读 · 只删自己的` | ✓ | ✓ | 仅自己上传的 | 适合互相取件、但各自负责自己的文件 |
 | `完整读写` | ✓ | ✓ | 全部 | 适合协作者整理同一批文件 |
 
@@ -156,12 +189,13 @@ docker compose logs | grep -E "访问地址|管理员密钥"
 
 ## 数据与目录布局
 
-`--data-dir` 下：
+数据目录（默认见「下载 / 安装」里的表格，或 `--data-dir` / `LANDROP_DATA_DIR` 指定）下：
 
 ```
 data/
 ├── state.sqlite3      # 空间、授权、访客、会话、文件索引、分块状态
 ├── admin-key.txt      # 自动生成的管理员密钥（0600，便于找回）
+├── desktop.json       # 桌面窗口的设置（主题、保存位置、上次的发送方式等）
 ├── files/<空间>/       # 已完成的文件本体（可用 --dir 或每个空间单独指定位置）
 ├── partial/           # 上传中的分块（不属于任何共享目录，不会出现在列表里）
 ├── trash/<空间>/       # 删除的文件，便于人工恢复
@@ -179,7 +213,7 @@ data/
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--data-dir` | `./data` | 数据目录（状态库、文件、分块、回收站） |
+| `--data-dir` | 平台默认目录 | 数据目录（状态库、文件、分块、回收站）；默认与桌面窗口相同，也可用 `LANDROP_DATA_DIR`。旧版习惯的当前目录 `./data` 若已有状态库会继续沿用 |
 | `--dir` | 空 | 把默认空间的共享目录放到指定位置（仅首次创建时生效） |
 | `--space` | `共享空间` | 默认空间名称 |
 | `--host` | `0.0.0.0` | 监听地址 |
@@ -192,7 +226,7 @@ data/
 | `--public-url` | 自动探测 | 分享链接里使用的对外地址；容器内必须设为宿主机局域网地址 |
 | `--no-banner` | 关闭 | 不打印启动横幅（GUI 调用时使用） |
 
-`landrop gui --autostart`：打开窗口后立即启动服务。
+`landrop gui --autostart`：打开窗口后立即启动收集服务。
 
 ### `.env`（Docker Compose）
 
@@ -211,6 +245,7 @@ data/
 
 除首页、`/admin` 与静态资源外，其余接口都需要登录（`HttpOnly` Cookie 会话）。**直连发送端说同一套最小接口**
 （`login` / `files` / `download` / `done`），所以 `landrop get` 对两种来源通用。
+`GET /<令牌>`（即用浏览器打开文件码）返回网页并自动登录；令牌随即从地址栏抹掉，响应带 `Referrer-Policy: no-referrer`。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -218,10 +253,10 @@ data/
 | `POST` | `/api/logout` | 退出登录 |
 | `GET` | `/api/me` | 当前会话与能力（未登录返回 `logged_in:false`） |
 | `GET` | `/api/files[?space=]` | 列出有权查看的文件（仅上传档返回空列表） |
-| `PUT` | `/api/upload?name=&id=&offset=&total=&sha256=` | 流式分块上传；`sha256` 可选但建议提供 |
+| `PUT` | `/api/upload?name=&id=&offset=&total=&sha256=[&path=]` | 流式分块上传；`sha256` 可选但建议提供；`path` 为文件夹内相对路径 |
 | `DELETE` | `/api/upload/abort?id=` | 放弃未完成的上传并清理分块 |
 | `GET` | `/api/download?id=` | 下载，支持 `Range` 与 `X-File-SHA256` 响应头 |
-| `POST` | `/api/done` | 接收端取完全部文件后调用；传输类授权据此累计次数 |
+| `POST` | `/api/done` | 接收端取完全部文件后调用；传输类授权据此累计次数（同一会话把文件都完整下载过也会自动计一次，不会重复） |
 | `GET` | `/api/verify?id=` | 从磁盘重算摘要并与登记值比对 |
 | `DELETE` | `/api/delete?id=` | 删除（按权限档判定，管理员可加 `&space=`） |
 | `GET` / `POST` | `/api/grants` | 管理员：列出 / 创建授权 |
@@ -251,7 +286,6 @@ data/
 > 需要公网或敏感数据时，请自行在前面加 TLS 反向代理，并重新评估信任边界。
 > 桌面形态没有容器隔离，局域网内任何能连上端口的人都可以尝试登录。
 
----
 - **直连发送端**：监听 `0.0.0.0` 的随机端口，令牌 96 位随机、常量时间比较，错误尝试 5 次即关闭；取件完成、超时或 Ctrl-C 后立即停止监听。
 - **路径安全（接收端）**：对端给的路径逐段清洗，拒绝 `..` 与绝对路径，并处理 Windows 非法字符/保留名。
 - **仍是明文 HTTP**：文件码等同凭证，抓包者可直接复制；请只在可信局域网内使用，或自行加 TLS 反代。
@@ -263,12 +297,22 @@ data/
 ```bash
 python3 tests/smoke.py          # 服务端：权限矩阵、校验、续传、撤销、空间隔离、一次性传输与迁移
 python3 tests/cli_check.py      # CLI：直连 send/get、经服务器 send、续传、一次性、撤销
-python3 tests/gui_check.py      # 桌面窗口：驱动真实控件走完 发送/接收/取消（Linux 用 xvfb-run）
-bash tests/binary_check.sh dist/landrop   # 对 PyInstaller 产物做登录/上传/摘要/重启验证
+python3 tests/gui_check.py      # 桌面窗口：驱动真实控件走完 发送/预览/接收/取消/经服务器/主题（Linux 用 xvfb-run）
+python3 tests/package_check.py --cli <landrop> --gui <窗口程序>   # 对打包产物做直连/服务/窗口自检
 ```
 
-CI 在 Linux、macOS、Windows 上跑前三套测试，并构建各平台二进制、单文件 pyz 与 Docker 镜像；
-推 `vX.Y.Z` 标签会自动发布 Release。
+打包：
+
+```bash
+pip install pyinstaller
+pyinstaller --clean --noconfirm landrop.spec   # 一个应用目录：窗口 + 命令行
+python packaging/package.py                    # 生成本平台的 安装版 + 免安装版（dist/release/）
+python packaging/build_pyz.py                  # 单文件 landrop.pyz
+```
+
+CI 在 Linux、macOS、Windows 上跑前三套测试；每个平台构建安装版与免安装版后**真实安装、运行 `package_check.py`、再卸载**
+（Windows 静默安装 + PATH 检查，macOS `installer -pkg`，Linux `apt install ./*.deb`），免安装版（单文件 exe、zip、dmg、AppImage）也逐个验证。
+推 `vX.Y.Z` 标签会自动发布 Release 与 Docker 镜像。
 
 ---
 
@@ -278,14 +322,16 @@ CI 在 Linux、macOS、Windows 上跑前三套测试，并构建各平台二进�
 .
 ├── landrop/
 │   ├── cli.py           # 统一入口：send / get / serve / revoke / gui
-│   ├── common.py        # 共用：文件码、路径清洗、进度、控制台
-│   ├── direct.py        # 直连发送端（进程内临时 HTTP 监听）
+│   ├── common.py        # 共用：文件码、路径清洗、数据目录、进度、控制台
+│   ├── direct.py        # 直连发送端（进程内临时 HTTP 监听 + 浏览器取件页）
 │   ├── remote.py        # 客户端：上传 / 下载 / 创建传输（服务与直连通用）
+│   ├── qr.py            # 二维码编码（窗口与 send --qr 共用）
 │   ├── server/          # 收集服务：app.py（HTTP 与权限）、store.py（SQLite）、static/（网页）
-│   └── gui/             # 桌面窗口（tkinter）：launcher.py、panels.py
-├── packaging/           # PyInstaller 入口、pyz 构建脚本
-├── tests/               # smoke / cli_check / gui_check / binary_check
-├── landrop.spec         # PyInstaller 配置
+│   └── gui/             # 桌面窗口（tkinter）：launcher.py（主窗口）、panels.py（页面）、
+│                        #   widgets.py / theme.py（自绘控件与设计令牌）、system.py、windrop.py（Windows 拖放）
+├── packaging/           # PyInstaller 入口、package.py（安装版 + 免安装版）、windows/ macos/ assets/、pyz 构建
+├── tests/               # smoke / cli_check / gui_check / package_check
+├── landrop.spec         # PyInstaller 配置：一个应用目录，窗口 + 命令行两个可执行文件
 ├── pyproject.toml
 ├── Dockerfile
 ├── docker-compose.yml
@@ -301,6 +347,21 @@ A：先确认两台电脑在同一局域网；发送端系统防火墙首次会�
 
 **Q：直连和「经服务器」有什么区别？**
 A：直连不需要任何服务，但发送端必须在线直到对方取完；经服务器会把文件上传到常驻服务，对方随时可取，到期/取够次数后服务端自动清理。
+
+**Q：对方是手机 / 没装 LAN Drop 怎么办？**
+A：让对方扫发送页的二维码，或把「浏览器网址」发过去，用浏览器打开就能下载；多个文件可以一次打包成 zip。
+反过来要让手机传给电脑，用「收集服务」，把访问地址（或二维码）给对方。
+
+**Q：安装版里的命令行在哪？**
+A：它和窗口是同一个程序。Windows 安装时默认把安装目录加入 PATH，新开终端输入 `landrop` 即可；macOS 安装包会链接
+`/usr/local/bin/landrop`；Linux 是 `/usr/bin/landrop`。免安装版在窗口「设置 → 命令行工具」里一键加入 PATH。
+
+**Q：免安装版的数据存在哪？**
+A：Windows zip 版存在程序目录的 `data/` 里（目录里有 `portable.txt` 时），整个文件夹拷走即可；
+Windows 单文件版、macOS dmg、Linux AppImage 与安装版相同，存在各平台的用户数据目录（见上表）。
+
+**Q：AppImage 打不开，提示 FUSE？**
+A：安装 `libfuse2`（或 `fuse3`），或者用 `./LANDrop-….AppImage --appimage-extract-and-run` 运行。
 
 **Q：管理员密钥忘了？**
 A：看启动日志，或读数据目录里的 `admin-key.txt`；也可以用 `--reset-admin --admin-key '新密钥'` 重置。

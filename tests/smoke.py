@@ -509,6 +509,74 @@ def run_checks(port, data_dir):
     check("超长文件名被截断", len(sm.safe_stored_name(long_name).encode("utf-8")) <= 240,
           str(len(sm.safe_stored_name(long_name).encode("utf-8"))))
 
+    print("\n[15] 文件夹上传（相对路径）")
+    from urllib.parse import quote
+    data = b"nested payload"
+    st, body, _ = admin.request(
+        "PUT", f"/api/upload?name=a.txt&path={quote('相册/2024/a.txt')}&id=nest1&offset=0"
+               f"&total={len(data)}", data, expect=200)
+    rec = json.loads(body)
+    check("显示名保留相对路径", rec.get("name") == "相册/2024/a.txt", str(rec.get("name")))
+    check("磁盘上只用文件名平铺存放", "/" not in rec.get("stored_name", "/")
+          and rec["stored_name"].startswith("a") and rec["stored_name"].endswith(".txt"),
+          str(rec.get("stored_name")))
+    st, _b, hdrs = admin.request("GET", f"/api/download?id={rec['id']}", expect=200)
+    check("下载文件名不含目录", hdrs.get("Content-Disposition", "").endswith("UTF-8''a.txt"),
+          hdrs.get("Content-Disposition", ""))
+    for bad in ("../evil.txt", "a/../../b.txt", "/"):
+        admin.request("PUT", f"/api/upload?name=x&path={quote(bad)}&id=bad{len(bad)}&offset=0&total=1",
+                      b"x", expect=400)
+    check("含 .. 或为空的相对路径被拒绝", True)
+    check("路径逐段清洗", sm.safe_rel_name('a:b/c*d.txt') == "a_b/c_d.txt", sm.safe_rel_name('a:b/c*d.txt'))
+
+    print("\n[16] 一次性传输：浏览器下载完全部文件也计一次取件")
+    st, body, _ = admin.request("POST", "/api/transfers", {"label": "web", "max_downloads": 1},
+                                expect=201)
+    tr = json.loads(body)["transfer"]
+    for i, payload in enumerate((b"first file", b"second file")):
+        admin.request("PUT", f"/api/upload?name=f{i}.bin&id=web{i}{tr['id']}&offset=0"
+                             f"&total={len(payload)}&space={tr['space_id']}", payload, expect=200)
+    web = Client(port)
+    web.request("POST", "/api/login", {"key": tr["secret"]}, expect=200)
+    st, body, _ = web.request("GET", "/api/files", expect=200)
+    ids = [f["id"] for f in json.loads(body)["files"]]
+    web.request("GET", f"/api/download?id={ids[0]}", headers={"Range": "bytes=0-3"}, expect=206)
+    web.request("GET", f"/api/download?id={ids[0]}", headers={"Range": "bytes=0-3"}, expect=206)
+    Client(port).request("POST", "/api/login", {"key": tr["secret"]}, expect=200)
+    check("只下了一部分：不计数", True)
+    web.request("GET", f"/api/download?id={ids[1]}", headers={"Range": "bytes=3-"}, expect=206)
+    Client(port).request("POST", "/api/login", {"key": tr["secret"]}, expect=200)
+    check("只读文件尾（播放器探测）：不计数", True)
+    web.request("GET", f"/api/download?id={ids[0]}", expect=200)
+    Client(port).request("POST", "/api/login", {"key": tr["secret"]}, expect=200)
+    check("只取完一个文件：不计数", True)
+    web.request("GET", f"/api/download?id={ids[1]}", expect=200)
+    Client(port).request("POST", "/api/login", {"key": tr["secret"]}, expect=401)
+    check("全部文件取完：一次性传输失效（无需 /api/done）", True)
+
+    st, body, _ = admin.request("POST", "/api/transfers", {"label": "twice", "max_downloads": 2},
+                                expect=201)
+    tr2 = json.loads(body)["transfer"]
+    admin.request("PUT", f"/api/upload?name=t.bin&id=tw{tr2['id']}&offset=0&total=3"
+                         f"&space={tr2['space_id']}", b"abc", expect=200)
+    cli_like = Client(port)
+    cli_like.request("POST", "/api/login", {"key": tr2["secret"]}, expect=200)
+    st, body, _ = cli_like.request("GET", "/api/files", expect=200)
+    cli_like.request("GET", f"/api/download?id={json.loads(body)['files'][0]['id']}", expect=200)
+    st, body, _ = cli_like.request("POST", "/api/done", {}, expect=200)
+    st, body, _ = admin.request("GET", "/api/transfers", expect=200)
+    n = next(x["downloads"] for x in json.loads(body)["transfers"] if x["id"] == tr2["id"])
+    check("下载完 + /api/done 同一会话只计一次", n == 1, str(n))
+
+    print("\n[17] 文件码即网址")
+    st, page, hdrs = anon.request("GET", "/" + tr2["secret"], expect=200)
+    check("/<令牌> 返回网页", b"<html" in page.lower() and hdrs.get("Content-Type", "").startswith("text/html"))
+    check("令牌网址禁止 Referer 外泄", hdrs.get("Referrer-Policy") == "no-referrer")
+    check("令牌网址不缓存", hdrs.get("Cache-Control") == "no-store")
+    anon.request("GET", "/short", expect=404)
+    anon.request("GET", "/admin.html", expect=200)
+    check("静态资源优先于令牌路由", True)
+
 
 if __name__ == "__main__":
     sys.exit(main())
