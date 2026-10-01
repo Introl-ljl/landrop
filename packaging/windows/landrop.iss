@@ -61,6 +61,9 @@ LicenseFile=..\..\LICENSE
 #endif
 #ifdef ZhIsl
   #define HaveZh
+  #pragma message "Chinese (Simplified) UI: " + ZhIsl
+#else
+  #pragma message "Chinese (Simplified) UI: not available, English only"
 #endif
 
 [Languages]

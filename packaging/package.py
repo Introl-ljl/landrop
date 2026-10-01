@@ -93,7 +93,7 @@ def package_windows(out: str, arch: str) -> list[str]:
     zip_dir(BUNDLE, portable, "LANDrop", {PORTABLE_MARKER: PORTABLE_NOTE})
     produced.append(portable)
     base = artifact("windows", arch, "setup", "")
-    run([find_iscc(), "/Qp", f"/DAppVersion={__version__}", f"/DSourceDir={BUNDLE}",
+    run([find_iscc(), f"/DAppVersion={__version__}", f"/DSourceDir={BUNDLE}",
          f"/DOutputDir={os.path.abspath(out)}", f"/DOutputBase={base}",
          os.path.join(ROOT, "packaging", "windows", "landrop.iss")])
     produced.append(os.path.join(out, base + ".exe"))

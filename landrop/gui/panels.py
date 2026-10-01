@@ -393,6 +393,8 @@ class SendPage(Page):
         self.cancel_btn = W.Button(act, "取消发送", self.cancel, kind="secondary", icon="x")
         self.cancel_btn.pack(side="right")
         self.again_btn = W.Button(act, "再发一批", self.reset, kind="primary", icon="plus")
+        self.revoke_btn = W.Button(act, "撤销文件码", self.revoke, kind="secondary", icon="x")
+        self.transfer = None        # 经服务器发送的结果：(服务地址, 密钥, 授权 ID)
 
     def _event(self, text):
         if self.events_empty.winfo_ismapped():
@@ -425,11 +427,16 @@ class SendPage(Page):
         self.app.set_busy("send", active)
         if active:
             self.again_btn.pack_forget()
+            self.revoke_btn.pack_forget()
             self.cancel_btn.configure_text("取消发送", icon="x", kind="secondary")
             self.cancel_btn.pack(side="right")
         else:
             self.cancel_btn.pack_forget()
             self.again_btn.pack(side="right")
+            if state == "ready" and self.transfer:
+                self.revoke_btn.pack(side="right", padx=(0, T.px(10)))
+            else:
+                self.revoke_btn.pack_forget()
 
     def _show_share(self):
         self.compose.pack_forget()
@@ -598,6 +605,8 @@ class SendPage(Page):
             return
         files = list(self.files)
         self._cancel = False
+        self._sent_to = (url, key)
+        self.transfer = None
         self._show_share()
         self._set_state("uploading", "连接中…")
         self.qr.set("")
@@ -634,14 +643,44 @@ class SendPage(Page):
         self.status.set(f"正在上传 {W.elide(name, 40)}  {common.human(done)} / {common.human(total)}"
                         + (f"  ·  {sp}" if sp else ""))
 
+    def revoke(self):
+        """撤销刚才经服务器生成的文件码（等同 landrop revoke <ID>）。"""
+        if not self.transfer:
+            return
+        if not messagebox.askokcancel("撤销文件码", "撤销后文件码立即失效，服务器上的文件会被自动清理。确定撤销？",
+                                      parent=self.app.root):
+            return
+        url, key, gid = self.transfer
+        ui = self.app.bridge
+
+        def work():
+            try:
+                remote.revoke(url, key, gid)
+                ui.call(self._revoked)
+            except common.CliError as exc:
+                ui.call(self.app.toast.show, f"撤销失败：{exc}", "err", 4000)
+
+        run_bg(work)
+
+    def _revoked(self):
+        self.transfer = None
+        self.code.set("")
+        self.qr.set("")
+        self.web_url.set("")
+        self.command.set("")
+        self._set_state("cancelled", "文件码已撤销，服务器上的文件会被自动清理。")
+        self._event("已撤销")
+
     def _server_done(self, res):
         self.progress.set(1)
+        self.transfer = (self._sent_to[0], self._sent_to[1], res["grant_id"])
         self._show_code(res["code"])
         self._set_state("ready", "已上传到服务器，对方随时可以取件；到期或取够次数后自动清理。")
         exp = f"{res['expire_hours']:g} 小时内有效" if res["expire_hours"] else "永不过期"
         times = f"可取 {res['max_downloads']} 次" if res["max_downloads"] else "取件次数不限"
         self.summary.configure(text=f"{res['count']} 个文件 · {common.human(res['bytes'])} · {exp} · {times}")
-        self.alt_label.configure(text=f"撤销：{common.cmd_prefix()} revoke {res['grant_id']}  （或在管理面板里撤销）")
+        self.alt_label.configure(text=f"随时可以点「撤销文件码」，或在管理面板 / 命令行 {common.cmd_prefix()} revoke "
+                                      f"{res['grant_id']} 撤销。")
         self._event("上传完成，文件码已生成")
 
 
@@ -979,6 +1018,7 @@ class ServicePage(Page):
                                      or default_data_dir())
         self.port = tk.StringVar(value=os.environ.get("LANDROP_PORT") or str(s.get("port", 8000)))
         self.scope = tk.StringVar(value=os.environ.get("LANDROP_SCOPE") or s.get("scope", "lan"))
+        self.address = tk.StringVar(value=s.get("service_address", "auto"))
         self.on = tk.BooleanVar(value=False)
         self.running = False
         self.httpd = None
@@ -1067,7 +1107,13 @@ class ServicePage(Page):
         W.label(r3, "可访问范围", size=10, weight="bold").pack(side="left")
         self.scope_seg = W.Segmented(r3, [("lan", "局域网"), ("local", "仅本机")], self.scope)
         self.scope_seg.pack(side="left", padx=(T.px(10), 0))
+        r4 = row(cb, pady=(T.px(14), 0))
+        W.label(r4, "访问地址用哪个网卡", size=10, weight="bold").pack(side="left")
+        W.label(r4, "多网卡 / VPN 时选同一局域网的那个", role="muted", size=9).pack(side="left", padx=(T.px(8), 0))
+        self.addr_select = W.Select(r4, self.address, [("auto", "自动")], width=240)
+        self.addr_select.pack(side="right")
         self.inputs = [f1, f2, f3, b1, b2]
+        run_bg(lambda: self.app.bridge.call(self._set_ips, direct.lan_addresses()))
 
         lc = self.card(padding=18)
         lh = row(lc.body)
@@ -1079,6 +1125,9 @@ class ServicePage(Page):
         self.log._roles = {"bg": "surface2", "fg": "text2", "insertbackground": "text"}
         self.log.configure(bg=T.c["surface2"], fg=T.c["text2"])
         self._render()
+
+    def _set_ips(self, ips):
+        self.addr_select.set_options([("auto", f"自动（{ips[0]}）")] + [(ip, ip) for ip in ips])
 
     # ---- 日志
     def append_log(self, text):
@@ -1139,6 +1188,8 @@ class ServicePage(Page):
             (w.set_enabled if hasattr(w, "set_enabled") else
              (lambda st, w=w: w.set_state("normal" if st else "disabled")))(not on)
         self.scope_seg.set_enabled(not on)
+        self.addr_select.configure(cursor="arrow" if on else "hand2")
+        self.addr_select.enabled = not on
         if self.on.get() != on:
             self.on.set(on)
         self.app.set_service_state(on)
@@ -1161,8 +1212,10 @@ class ServicePage(Page):
         try:
             if share_dir:
                 os.makedirs(share_dir, exist_ok=True)
+            addr = self.address.get()
+            public = f"http://{addr}:{port}" if (addr != "auto" and host == "0.0.0.0") else ""
             self.info = srv.prepare(data_dir=data_dir or common.default_data_dir(),
-                                    share_dir=share_dir, host=host, port=port)
+                                    share_dir=share_dir, host=host, port=port, public_url=public)
             self.httpd = srv.make_server(host, port)
         except OSError as exc:
             self.on.set(False)

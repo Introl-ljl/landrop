@@ -19,7 +19,7 @@ from . import __version__
 from .common import (CliError, collect_entries, human, make_code, normalize_base, progress,
                      progress_end, setup_console, cmd_prefix)
 from .direct import DirectSender, lan_addresses
-from .remote import (Client, fetch_files, list_remote, read_admin_key, send_files)
+from .remote import fetch_files, list_remote, read_admin_key, revoke, send_files
 
 DEFAULT_URL = "http://127.0.0.1:8000"
 
@@ -181,9 +181,7 @@ def cmd_get(args) -> int:
 
 
 def cmd_revoke(args) -> int:
-    cli = Client(args.server)
-    cli.login(find_admin_key(args))
-    cli.request("POST", "/api/grants/revoke", {"id": args.grant_id})
+    revoke(args.server, find_admin_key(args), args.grant_id)
     print(f"已撤销 {args.grant_id}，文件码立即失效")
     return 0
 

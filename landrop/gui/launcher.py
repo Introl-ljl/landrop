@@ -259,7 +259,7 @@ class LauncherApp:
             s["server_url"] = url
         if not os.environ.get("LANDROP_PORT"):
             s.update(port=self.service.port.get(), scope=self.service.scope.get(),
-                     share_dir=self.service.share_dir.get())
+                     share_dir=self.service.share_dir.get(), service_address=self.service.address.get())
         if not os.environ.get("LANDROP_DATA_DIR"):
             s["data_dir"] = self.service.data_dir.get()
         self.settings = s

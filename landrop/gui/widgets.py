@@ -795,6 +795,7 @@ class Select(Canvas):
         super().__init__(parent, height=self._h, width=T.px(width), cursor="hand2", **kw)
         self.var, self.options = variable, list(options)
         self._hover = False
+        self.enabled = True
         self.bind("<Button-1>", self._open)
         self.bind("<Enter>", lambda e: self._sethover(True))
         self.bind("<Leave>", lambda e: self._sethover(False))
@@ -810,6 +811,8 @@ class Select(Canvas):
         self.draw()
 
     def _open(self, _e=None):
+        if not self.enabled:
+            return
         c = T.c
         menu = tk.Menu(self, tearoff=0, bg=c["surface"], fg=c["text"], activebackground=c["accent_soft"],
                        activeforeground=c["text"], bd=1, relief="solid", font=T.font(10))

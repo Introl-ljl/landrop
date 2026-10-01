@@ -39,6 +39,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Warning "choco upgrade innosetup failed; using preinstalled" }
           $global:LASTEXITCODE = 0
 
+      # 源码级窗口测试（含 Windows 拖放）：发布流程也自带验证，不依赖 ci.yml
+      - name: GUI end-to-end (source)
+        if: runner.os != 'Linux'
+        run: python -u tests/gui_check.py
+      - name: GUI end-to-end (source, Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+          xvfb-run -a python -u tests/gui_check.py
+
       - name: Build app bundle (GUI + CLI)
         run: pyinstaller --clean --noconfirm landrop.spec
 
@@ -54,7 +64,6 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -eux
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
           sudo apt-get install -y ./out/*-setup.deb
           test -f /usr/share/applications/landrop.desktop
           test -L /usr/bin/landrop && test -L /usr/bin/landrop-gui

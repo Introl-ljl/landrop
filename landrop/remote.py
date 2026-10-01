@@ -139,6 +139,13 @@ def send_files(server: str, key: str, paths: list[str], expire_hours: float = 24
     }
 
 
+def revoke(server: str, key: str, grant_id: str) -> None:
+    """撤销一个传输 / 分享（命令行 revoke 与窗口里的「撤销文件码」共用）。"""
+    cli = Client(server)
+    cli.login(key)
+    cli.request("POST", "/api/grants/revoke", {"id": grant_id})
+
+
 def _public_url(cli: Client) -> str:
     """服务端知道自己的对外地址（可能是局域网 IP），比 127.0.0.1 更适合发给别人。"""
     try:

@@ -155,6 +155,19 @@ def main():
     recv.receive()
     check(pump(lambda: recv.task_pill.text == "失败"), "一次性：第二次取件失败")
 
+    from landrop.gui import panels
+    panels.messagebox.askokcancel = lambda *a, **k: True
+    send.reset()
+    send.send()
+    check(pump(lambda: send.revoke_btn.winfo_ismapped()), "经服务器发送后可「撤销文件码」")
+    code3 = local(send.code.get())
+    send.revoke()
+    check(pump(lambda: send.state_pill.text == "已取消" and not send.code.get()), "撤销后文件码清空")
+    recv.code.set(code3)
+    recv.dir.set(os.path.join(tmp, "recv3"))
+    recv.receive()
+    check(pump(lambda: recv.task_pill.text == "失败"), "撤销后的文件码取件失败")
+
     print("\n[主题与设置]")
     app.apply_theme("dark")
     app.root.update()
