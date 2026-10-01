@@ -16,8 +16,8 @@ import os
 import sys
 
 from . import __version__
-from .common import (CliError, human, make_code, normalize_base, progress, progress_end,
-                     setup_console, cmd_prefix)
+from .common import (CliError, collect_entries, human, make_code, normalize_base, progress,
+                     progress_end, setup_console, cmd_prefix)
 from .direct import DirectSender, lan_addresses
 from .remote import (Client, fetch_files, list_remote, read_admin_key, send_files)
 
@@ -34,7 +34,7 @@ def find_admin_key(args) -> str:
 
 def pick_interactively() -> list[str]:
     if not sys.stdin.isatty():
-        raise CliError("没有指定文件。用法：landrop.py send 文件1 [文件2 ...]")
+        raise CliError(f"没有指定文件。用法：{cmd_prefix()} send 文件或文件夹 [...]")
     files = sorted(p for p in os.listdir(".") if os.path.isfile(p))
     if not files:
         raise CliError("当前目录没有文件可选")
@@ -61,7 +61,7 @@ def pick_interactively() -> list[str]:
     return chosen
 
 
-def expand_paths(items: list[str], allow_dirs: bool = False) -> list[str]:
+def expand_paths(items: list[str]) -> list[str]:
     out: list[str] = []
     for item in items:
         item = os.path.expanduser(item)
@@ -69,8 +69,6 @@ def expand_paths(items: list[str], allow_dirs: bool = False) -> list[str]:
         if not matches:
             raise CliError(f"没有匹配：{item}")
         for m in matches:
-            if os.path.isdir(m) and not allow_dirs:
-                raise CliError(f"{m} 是目录；请先打包（如 tar/zip）或用通配符选文件")
             if not (os.path.isfile(m) or os.path.isdir(m)):
                 raise CliError(f"文件不存在：{m}")
             ap = os.path.abspath(m)
@@ -80,9 +78,10 @@ def expand_paths(items: list[str], allow_dirs: bool = False) -> list[str]:
 
 
 def cmd_send_via_server(args) -> int:
-    paths = expand_paths(args.files) if args.files else expand_paths(pick_interactively())
-    total_bytes = sum(os.path.getsize(p) for p in paths)
-    print(f"上传 {len(paths)} 个文件（{human(total_bytes)}）到 {normalize_base(args.server)} …",
+    paths = expand_paths(args.files or pick_interactively())
+    entries = collect_entries(paths)
+    total_bytes = sum(os.path.getsize(full) for full, _ in entries)
+    print(f"上传 {len(entries)} 个文件（{human(total_bytes)}）到 {normalize_base(args.server)} …",
           file=sys.stderr)
 
     last = {"name": None}
@@ -115,7 +114,7 @@ def cmd_send(args) -> int:
     """默认直连：本机临时监听，等对方 get；加 --server 才走常驻服务。"""
     if args.server:
         return cmd_send_via_server(args)
-    paths = expand_paths(args.files or pick_interactively(), allow_dirs=True)
+    paths = expand_paths(args.files or pick_interactively())
     note = lambda m: print(f"  · {m}", file=sys.stderr)  # noqa: E731
     sender = DirectSender(paths, port=args.port, receivers=args.receivers, on_event=note)
     print(f"准备 {len(sender.entries)} 个文件（{human(sender.total_bytes)}），计算校验值…",

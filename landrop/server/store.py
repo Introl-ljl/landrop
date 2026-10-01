@@ -161,6 +161,16 @@ def safe_stored_name(name: str) -> str:
     return name
 
 
+def safe_rel_name(rel: str) -> str:
+    """文件夹里的相对路径（如 ``相册/2024/a.jpg``）：逐段清洗后用 / 连接，作为显示名。
+    磁盘上仍按清洗后的文件名平铺存放，相对路径只用于展示和接收端还原目录结构。
+    含 ``..`` 或清洗后为空时抛 ValueError。"""
+    parts = [p for p in (rel or "").replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts) or len(parts) > 32:
+        raise ValueError("bad path")
+    return "/".join(safe_stored_name(p) for p in parts)
+
+
 def file_sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:

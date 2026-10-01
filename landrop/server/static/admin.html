@@ -403,6 +403,16 @@ $("#grantBox").addEventListener("click", async e => {
 });
 
 (async function init(){
+  // 桌面窗口打开管理面板时把密钥放在 #k= 里（片段不会发给服务器）：读完立刻抹掉并自动登录
+  const m = /[#&]k=([^&]+)/.exec(location.hash || "");
+  if(m){
+    let key = m[1];
+    try{ key = decodeURIComponent(key); }catch(e){}
+    try{ history.replaceState(null, "", location.pathname + location.search); }catch(e){}
+    showGate();
+    $("#keyInput").value = key;
+    return doLogin();
+  }
   try{
     const d = await jget("/api/grants");
     state.spaces = d.spaces || []; state.grants = d.grants || [];

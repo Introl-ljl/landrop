@@ -14,22 +14,61 @@ class CliError(Exception):
 
 
 def setup_console():
-    """Windows 控制台默认是 GBK 等代码页：强制 UTF-8 输出，避免中文文件名/提示乱码或崩溃。"""
+    """Windows 控制台默认是 GBK 等代码页：强制 UTF-8 输出，避免中文文件名/提示乱码或崩溃。
+    窗口版没有控制台（stdout 为 None）时什么也不做。"""
     for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        try:      # 行缓冲：输出接到管道 / 被脚本读取时，文件码要立刻出现，而不是等进程结束
+            stream.reconfigure(encoding="utf-8", errors="replace",  # type: ignore[attr-defined]
+                               line_buffering=True)
         except Exception:  # noqa: BLE001
             pass
 
 
+PORTABLE_MARKER = "portable.txt"
+
+
+def app_dir() -> str | None:
+    """打包版的应用目录（可执行文件所在目录）；源码 / pyz 运行时返回 None。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.realpath(sys.executable))
+    return None
+
+
+def portable_dir() -> str | None:
+    """免安装版：应用目录里有 portable.txt 时，数据跟着应用目录走（U 盘拷走即用）。
+
+    macOS 不支持：.app 内部不可写（App Translocation / 签名），免安装版仍用系统目录。"""
+    d = app_dir()
+    if d and sys.platform != "darwin" and os.path.isfile(os.path.join(d, PORTABLE_MARKER)):
+        return d
+    return None
+
+
 def default_data_dir() -> str:
-    """与 desktop.py 的数据目录约定一致，便于本机直接读到 admin-key.txt。"""
+    """数据目录的唯一约定（窗口、``landrop serve``、``send --server`` 读密钥都用它）。"""
+    portable = portable_dir()
+    if portable:
+        return os.path.join(portable, "data")
     if sys.platform.startswith("win"):
         return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "LANDrop")
     if sys.platform == "darwin":
         return os.path.expanduser("~/Library/Application Support/LANDrop")
     base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     return os.path.join(base, "landrop")
+
+
+def resolve_data_dir(explicit: str | None = None) -> tuple[str, str]:
+    """决定数据目录，返回 (目录, 来源说明)。优先级：
+    显式参数 → 环境变量 LANDROP_DATA_DIR → 旧版习惯的 ./data（已有状态库时）→ 平台默认目录。"""
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit)), "参数"
+    env = os.environ.get("LANDROP_DATA_DIR")
+    if env:
+        return os.path.abspath(os.path.expanduser(env)), "LANDROP_DATA_DIR"
+    legacy = os.path.abspath("data")
+    if os.path.isfile(os.path.join(legacy, "state.sqlite3")) and not portable_dir():
+        return legacy, "当前目录已有的 ./data（旧版默认位置）"
+    return default_data_dir(), "默认位置"
 
 
 def cmd_prefix() -> str:
@@ -96,6 +135,29 @@ def extract_code(text: str) -> str:
     """从粘贴内容里抠出文件码：整条取件命令、带引号的、多余空白都能认。"""
     m = re.search(r"(?:https?://)?[\w.\-\[\]:]+:\d+/[A-Za-z0-9_-]+", text or "")
     return m.group(0) if m else (text or "").strip()
+
+
+def collect_entries(paths: list[str]) -> list[tuple[str, str]]:
+    """把要发送的文件/文件夹展开成 [(本地路径, 相对名)]。直连与经服务器共用，行为一致：
+    文件用文件名，文件夹保留「文件夹名/子路径」结构；重名只取第一个。"""
+    entries, seen, out = [], set(), []
+    for p in paths:
+        p = os.path.abspath(p)
+        if os.path.isdir(p):
+            top = os.path.basename(p.rstrip("/\\")) or "folder"
+            for root, dirs, files in os.walk(p):
+                dirs.sort()
+                for fn in sorted(files):
+                    full = os.path.join(root, fn)
+                    if os.path.isfile(full):
+                        entries.append((full, top + "/" + os.path.relpath(full, p).replace(os.sep, "/")))
+        elif os.path.isfile(p):
+            entries.append((p, os.path.basename(p)))
+    for full, rel in entries:
+        if rel not in seen:
+            seen.add(rel)
+            out.append((full, rel))
+    return out
 
 
 def unique_path(directory: str, name: str) -> str:

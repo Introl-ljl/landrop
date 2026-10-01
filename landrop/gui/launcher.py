@@ -303,28 +303,52 @@ class LauncherApp:
         self.root.mainloop()
 
 
+def _ensure_streams():
+    """窗口版（PyInstaller --windowed）没有控制台，sys.stdout/stderr 是 None，
+    服务端日志里的 print 会直接抛异常；换成空设备。"""
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
+def smoke_test(app) -> int:
+    """打包产物自检：页面都能建出来、服务能启动并响应、能正常停止。CI 安装后运行。"""
+    import urllib.request
+    app.root.update()
+    app.start()
+    if not app.running:
+        return 1
+    with urllib.request.urlopen(app.info["local_url"] + "/", timeout=10) as r:
+        ok = r.status == 200 and b"LAN Drop" in r.read()
+    app.stop()
+    app.root.update()
+    return 0 if ok else 1
+
+
 def main(argv=None):
+    _ensure_streams()
     try:
         import tkinter  # noqa: F401
     except ImportError:
-        print("未检测到 tkinter。请安装带 tkinter 的 Python，或改用命令行：\n"
-              "  python3 server.py --data-dir ./data", file=sys.stderr)
+        print("未检测到 tkinter。请安装带 tkinter 的 Python，或改用命令行：landrop --help",
+              file=sys.stderr)
         return 2
     import argparse
-    ap = argparse.ArgumentParser(description="LAN Drop 桌面启动器")
+    ap = argparse.ArgumentParser(prog="landrop gui", description="LAN Drop 桌面窗口")
     ap.add_argument("--autostart", action="store_true",
-                    help="打开窗口后立即启动服务（适合开机自启）")
-    ap.add_argument("--no-window", action="store_true",
-                    help="不开窗口，只按环境变量启动服务（等价于 server.py）")
-    args = ap.parse_args(argv)
-
-    if args.no_window:
-        return srv.main(["--data-dir", os.environ.get("LANDROP_DATA_DIR") or default_data_dir(),
-                         "--host", "127.0.0.1" if os.environ.get("LANDROP_SCOPE") == "local"
-                         else "0.0.0.0",
-                         "--port", os.environ.get("LANDROP_PORT") or "8000"])
+                    help="打开窗口后立即启动收集服务（适合开机自启）")
+    ap.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
+    args, _unknown = ap.parse_known_args(argv)     # macOS 从 Finder 启动可能带 -psn_… 参数
 
     app = LauncherApp()
+    if args.smoke_test:
+        try:
+            return smoke_test(app)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            return 1
+        finally:
+            app.root.destroy()
     if args.autostart:
         app.root.after(300, app.start)
     app.run()
