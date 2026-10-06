@@ -288,8 +288,10 @@ class DirectSender:
                 if not sender._ready.is_set():
                     return self._not_ready()
                 if path == "/api/files":
+                    with sender._lock:
+                        fetched = set(sender._complete.get(sid, set()))
                     return self._json({"ok": True, "files": [
-                        {"id": e["id"], "name": e["name"], "size": e["size"],
+                        {"id": e["id"], "name": e["name"], "size": e["size"], "received": e["id"] in fetched,
                          "sha256": e.get("sha256", ""), "mtime": 0} for e in sender.entries]})
                 if path == "/api/download":
                     return self._download(parsed, sid)

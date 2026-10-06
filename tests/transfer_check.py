@@ -263,6 +263,36 @@ class Transfers(unittest.TestCase):
             self.assertEqual(os.stat(os.path.join(self.tmp.name, 'receivers', cookies[0])).st_mode & 0o777,
                              0o600)
 
+    def test_partial_then_full_pickup_finishes_missing_files_last(self):
+        gid, secret, files = self.transfer([b'abcd', b'efgh'])
+        code = common.make_code(self.base, secret)
+        dest = os.path.join(self.tmp.name, 'partial-full')
+        remote.fetch_files(code, dest, only=[files[0]['name']], on_progress=lambda *a: None)
+        self.assertEqual(self.downloads(gid), 0)
+        saved = remote.fetch_files(code, dest, on_progress=lambda *a: None)
+        self.assertEqual(len(saved), 2)
+        self.assertTrue(os.path.isfile(os.path.join(dest, files[1]['name'])))
+        self.wait_for(lambda: self.downloads(gid) == 1)
+
+    def test_direct_partial_then_full_pickup_keeps_listener_until_last_file(self):
+        paths = []
+        for i in (0, 1):
+            path = os.path.join(self.tmp.name, '%s.bin' % i)
+            with open(path, 'wb') as f:
+                f.write(b'abcd')
+            paths.append(path)
+        sender = direct.DirectSender(paths, host='127.0.0.1')
+        self.senders.append(sender)
+        sender.prepare_hashes()
+        sender.start()
+        code = common.make_code('http://127.0.0.1:%s' % sender.port, sender.token)
+        dest = os.path.join(self.tmp.name, 'direct-partial-full')
+        remote.fetch_files(code, dest, only=['1.bin'], on_progress=lambda *a: None)
+        self.assertFalse(sender.finished.is_set())
+        saved = remote.fetch_files(code, dest, on_progress=lambda *a: None)
+        self.assertEqual(len(saved), 2)
+        self.assertEqual(sender.wait(5), 'done')
+
     def test_final_upload_response_loss_is_idempotent(self):
         for fault in ('upload_headers', 'upload_body'):
             for size in (0, 3, 5):

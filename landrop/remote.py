@@ -321,6 +321,8 @@ def fetch_files(code: str, directory: str, only=None, force: bool = False,
     identity = hashlib.sha256((code + "\n" + directory).encode()).hexdigest()
     cookie_file = os.path.join(default_data_dir(), "receivers", identity + ".cookies")
     cli, files = list_remote(code, only, cookie_file=cookie_file)
+    # Finish the pickup on the last file, not midway through a retry of a partial batch.
+    files.sort(key=lambda item: not item.get("received", False))
     saved = []
     for item in files:
         target = download_file(cli, item, directory, force, on_progress)

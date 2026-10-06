@@ -402,6 +402,14 @@ class Store:
                         (grant_id, visitor_id, file_id))
         return json.loads(row["ranges"]) if row else []
 
+    def fetched_files(self, grant_id: str, visitor_id: str):
+        rows = self._query(
+            "SELECT fp.file_id, fp.ranges, f.size FROM fetch_ranges fp "
+            "JOIN files f ON f.id=fp.file_id WHERE fp.grant_id=? AND fp.visitor_id=?",
+            (grant_id, visitor_id))
+        return {r["file_id"] for r in rows
+                if json.loads(r["ranges"]) == ([[0, r["size"]]] if r["size"] else [])}
+
     def list_transfers(self):
         rows = self._query(
             "SELECT g.*, s.id AS sid FROM grants g JOIN spaces s ON s.id=g.space_id "

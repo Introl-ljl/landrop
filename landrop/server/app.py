@@ -517,6 +517,8 @@ class Handler(BaseHTTPRequestHandler):
         rows = STORE.list_files(space_id)
         space = STORE.get_space(space_id)
         my_visitor = auth["visitor"]["id"]
+        fetched = (STORE.fetched_files(auth["grant"]["id"], my_visitor)
+                   if self._transfer_grant(auth) is not None else set())
         delete_scope = caps.get("delete")
         self._send_json({
             "ok": True,
@@ -527,6 +529,7 @@ class Handler(BaseHTTPRequestHandler):
             "files": [
                 {
                     "id": r["id"],
+                    "received": r["id"] in fetched,
                     "name": r["display_name"],
                     "stored_name": r["stored_name"],
                     "size": r["size"],
