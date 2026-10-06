@@ -125,6 +125,33 @@ def direct_checks(tmp):
         check(True, "safe_relpath 拒绝 ..")
 
 
+def browser_checks(tmp):
+    """文件码当网址用：没装 LAN Drop 的设备用浏览器打开就能下载；下完全部文件发送端自动结束。"""
+    print("\n[直连：浏览器取件]")
+    import http.cookiejar
+    import urllib.request
+    src = os.path.join(tmp, "bsrc")
+    os.makedirs(src)
+    with open(os.path.join(src, "photo.jpg"), "wb") as f:
+        f.write(b"jpegdata")
+    proc, code = start_direct_sender([os.path.join(src, "photo.jpg")])
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    try:
+        with opener.open("http://" + code, timeout=10) as r:
+            page = r.read().decode("utf-8")
+            check("photo.jpg" in page and r.headers.get("Referrer-Policy") == "no-referrer",
+                  "浏览器打开文件码看到文件列表")
+        with opener.open(f"http://{code.partition('/')[0]}/api/download?id=0", timeout=10) as r:
+            check(r.read() == b"jpegdata" and "photo.jpg" in r.headers.get("Content-Disposition", ""),
+                  "浏览器下载内容与文件名正确")
+        check(proc.wait(timeout=15) == 0, "浏览器下完全部文件后发送端自动结束")
+    except Exception as exc:  # noqa: BLE001
+        check(False, f"浏览器取件：{exc!r}")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="landrop-cli-")
     port = free_port()
@@ -188,7 +215,25 @@ def main():
         rc, _, _ = run(["get", code1, "-o", d1])
         check(rc == 1, "经服务的传输：取完一次后文件码失效")
 
+        # 文件夹经服务器：与直连一致，保留目录结构
+        tree = os.path.join(tmp, "tree")
+        os.makedirs(os.path.join(tree, "相册", "2024"))
+        with open(os.path.join(tree, "相册", "2024", "a.txt"), "w", encoding="utf-8") as f:
+            f.write("nested")
+        with open(os.path.join(tree, "相册", "cover.txt"), "w", encoding="utf-8") as f:
+            f.write("cover")
+        rc, out, err = run(["send", os.path.join(tree, "相册"), "--server", server, "--key", KEY,
+                            "--public-url", server])
+        check(rc == 0, "send --server 接受文件夹" + ("" if rc == 0 else "：" + err))
+        m = re.search(r"文件码:\s+(\S+)", out)
+        if m:
+            d2 = os.path.join(tmp, "tree-out")
+            rc, _, _ = run(["get", m.group(1), "-o", d2])
+            check(rc == 0 and open(os.path.join(d2, "相册", "2024", "a.txt"), encoding="utf-8").read()
+                  == "nested", "经服务器取回的文件夹结构一致")
+
         direct_checks(tmp)
+        browser_checks(tmp)
     finally:
         proc.terminate()
         try:

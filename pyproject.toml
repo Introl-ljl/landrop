@@ -23,6 +23,9 @@ Homepage = "https://github.com/Introl-ljl/landrop"
 [project.scripts]
 landrop = "landrop.cli:main"
 
+[project.gui-scripts]
+landrop-gui = "landrop.gui.launcher:main"
+
 [tool.setuptools.dynamic]
 version = { attr = "landrop.__version__" }
 
@@ -30,4 +33,4 @@ version = { attr = "landrop.__version__" }
 include = ["landrop*"]
 
 [tool.setuptools.package-data]
-"landrop.server" = ["static/*.html", "static/**/*"]
+"landrop.server" = ["static/*.html"]

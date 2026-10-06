@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import http.cookiejar
 import json
 import os
@@ -10,8 +11,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .common import (CliError, CHUNK, sha256_file, cmd_prefix, default_data_dir, make_code, normalize_base,
-                     parse_code, progress, safe_relpath, unique_path)
+from .common import (CliError, CHUNK, sha256_file, cmd_prefix, collect_entries, default_data_dir,
+                     make_code, normalize_base, parse_code, progress, safe_relpath, unique_path)
 
 
 class Client:
@@ -43,6 +44,8 @@ class Client:
             raise err from None
         except urllib.error.URLError as exc:
             raise CliError(f"连接不上 {self.base}：{exc.reason}") from None
+        except (OSError, http.client.HTTPException) as exc:     # 连接被重置 / 对端已关闭等
+            raise CliError(f"与 {self.base} 的连接中断：{exc}") from None
         if raw:
             return resp
         with resp:
@@ -68,15 +71,18 @@ def read_admin_key(data_dir: str | None = None) -> str:
                    "或 --data-dir 指向含 admin-key.txt 的数据目录")
 
 
-def upload_file(cli: Client, space_id: str, path: str, on_progress=progress):
+def upload_file(cli: Client, space_id: str, path: str, on_progress=progress, rel: str = ""):
+    """上传一个文件；rel 是文件夹里的相对路径（如 ``相册/a.jpg``），服务端据此保留目录结构。"""
     name = os.path.basename(path)
     total = os.path.getsize(path)
     digest = sha256_file(path)
     upload_id = secrets.token_hex(8)
     offset = 0
-    q = lambda off: "/api/upload?" + urllib.parse.urlencode({  # noqa: E731
-        "name": name, "id": upload_id, "offset": off, "total": total,
-        "sha256": digest, "space": space_id})
+    params = {"name": name, "id": upload_id, "total": total, "sha256": digest, "space": space_id}
+    if rel and rel != name:
+        params["path"] = rel
+        name = rel
+    q = lambda off: "/api/upload?" + urllib.parse.urlencode(dict(params, offset=off))  # noqa: E731
     with open(path, "rb") as f:
         while True:
             f.seek(offset)
@@ -108,14 +114,17 @@ def send_files(server: str, key: str, paths: list[str], expire_hours: float = 24
 
     传输到期 / 取够次数 / 被撤销后，服务端会自动连文件一起清理，不会留下空间与授权。
     """
+    entries = collect_entries(paths)
+    if not entries:
+        raise CliError("没有可发送的文件")
     cli = Client(server)
     cli.login(key)
-    label = (label or ", ".join(os.path.basename(p) for p in paths))[:60]
+    label = (label or ", ".join(os.path.basename(p.rstrip("/\\")) for p in paths))[:60]
     tr = cli.request("POST", "/api/transfers", {
         "label": label, "expires_hours": expire_hours, "max_downloads": max_downloads})["transfer"]
     try:
-        for p in paths:
-            upload_file(cli, tr["space_id"], p, on_progress)
+        for full, rel in entries:
+            upload_file(cli, tr["space_id"], full, on_progress, rel)
     except BaseException:
         try:                                    # 半途失败：撤销，交给服务端清理
             cli.request("POST", "/api/grants/revoke", {"id": tr["id"]})
@@ -124,10 +133,17 @@ def send_files(server: str, key: str, paths: list[str], expire_hours: float = 24
         raise
     code = make_code(normalize_base(public_url or _public_url(cli) or cli.base), tr["secret"])
     return {
-        "code": code, "grant_id": tr["id"], "count": len(paths),
-        "bytes": sum(os.path.getsize(p) for p in paths), "expire_hours": expire_hours,
+        "code": code, "grant_id": tr["id"], "count": len(entries),
+        "bytes": sum(os.path.getsize(full) for full, _ in entries), "expire_hours": expire_hours,
         "max_downloads": max_downloads, "command": f"{cmd_prefix()} get {code}",
     }
+
+
+def revoke(server: str, key: str, grant_id: str) -> None:
+    """撤销一个传输 / 分享（命令行 revoke 与窗口里的「撤销文件码」共用）。"""
+    cli = Client(server)
+    cli.login(key)
+    cli.request("POST", "/api/grants/revoke", {"id": grant_id})
 
 
 def _public_url(cli: Client) -> str:
@@ -165,7 +181,10 @@ def download_file(cli: Client, item: dict, directory: str, force: bool,
     done = resume
     with resp, open(part, "ab" if resume else "wb") as f:
         while True:
-            block = resp.read(1024 * 1024)
+            try:
+                block = resp.read(1024 * 1024)
+            except (OSError, http.client.HTTPException):
+                break                       # 连接中断：按「下载不完整」处理，保留 .part 便于续传
             if not block:
                 break
             f.write(block)

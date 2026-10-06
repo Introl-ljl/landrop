@@ -1,41 +1,86 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller 打包配置。必须在目标操作系统上分别执行（不能跨平台交叉编译）::
+"""PyInstaller 打包配置。必须在目标操作系统上分别执行（不能交叉编译）::
 
     pyinstaller --clean --noconfirm landrop.spec
+    python packaging/package.py          # 再把产物做成 安装版 + 免安装版
 
-产物::
+产物是**一个**应用目录，里面两个可执行文件共用同一份运行时：
 
-    dist/landrop        命令行（所有平台）：send / get / serve / revoke，含网页静态资源
-    dist/landrop-gui    桌面窗口（仅 Windows 与 macOS 生成）
+    Windows   dist/LANDrop/LAN Drop.exe（窗口）  + landrop.exe（命令行）
+    Linux     dist/LANDrop/landrop-gui（窗口）   + landrop（命令行）
+    macOS     dist/LAN Drop.app/Contents/MacOS/LAN Drop（窗口）+ …/MacOS/landrop（命令行）
 
-另有单文件 zipapp（任何装了 Python 3.8+ 的系统）::
-
-    python packaging/build_pyz.py        # -> dist/landrop.pyz
+所以安装一次就同时拥有图形界面与 ``landrop`` 命令，不再有单独的命令行安装包。
+Windows 另外生成单文件的 dist/LANDrop-portable.exe（只有窗口，免安装、无需解压）。
 """
 
 import os
 import sys
 
 ROOT = os.path.abspath(os.getcwd())
+sys.path.insert(0, ROOT)
+from landrop import __version__  # noqa: E402
+
 STATIC = os.path.join(ROOT, "landrop", "server", "static")
-datas = [(STATIC, os.path.join("landrop", "server", "static"))]
-IS_LINUX = sys.platform.startswith("linux")
-common_excludes = ["numpy", "PIL", "pytest", "setuptools", "pip"]
+ASSETS = os.path.join(ROOT, "packaging", "assets")
+IS_WIN = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
 
-# ---- 命令行（所有平台；不需要 tkinter） ----
-a_cli = Analysis([os.path.join("packaging", "entry_cli.py")], pathex=[ROOT], datas=datas,
-                 hiddenimports=["landrop.server.app", "landrop.server.store"],
-                 excludes=common_excludes + ["tkinter"], noarchive=False)
-pyz_cli = PYZ(a_cli.pure)
-exe_cli = EXE(pyz_cli, a_cli.scripts, a_cli.binaries, a_cli.datas, [],
-              name="landrop", debug=False, strip=False, upx=False, console=True)
+# 网页静态资源；static/downloads/ 是 Docker 构建时放 pyz 的地方，本地可能残留旧二进制，不打进来
+datas = []
+for base, dirs, files in os.walk(STATIC):
+    dirs[:] = [d for d in dirs if d != "downloads"]
+    for fn in files:
+        rel = os.path.relpath(base, ROOT)
+        datas.append((os.path.join(base, fn), rel))
 
-# ---- 桌面窗口：仅 Windows 与 macOS ----
-if not IS_LINUX:
-    a_gui = Analysis([os.path.join("packaging", "entry_gui.py")], pathex=[ROOT], datas=datas,
-                     hiddenimports=["landrop.server.app", "landrop.server.store",
-                                    "landrop.gui.launcher", "landrop.gui.panels"],
-                     excludes=common_excludes, noarchive=False)
-    pyz_gui = PYZ(a_gui.pure)
-    exe_gui = EXE(pyz_gui, a_gui.scripts, a_gui.binaries, a_gui.datas, [],
-                  name="landrop-gui", debug=False, strip=False, upx=False, console=False)
+hidden = ["landrop.server.app", "landrop.server.store", "landrop.gui.launcher",
+          "landrop.gui.panels", "landrop.gui.theme", "landrop.gui.widgets", "landrop.gui.icon",
+          "landrop.gui.system", "landrop.gui.windrop", "landrop.qr"]
+excludes = ["numpy", "PIL", "pytest", "setuptools", "pip"]
+icon = os.path.join(ASSETS, "landrop.ico" if IS_WIN else "landrop.icns")
+
+GUI_NAME = "LAN Drop" if (IS_WIN or IS_MAC) else "landrop-gui"
+CLI_NAME = "landrop"
+
+
+def analysis(entry):
+    return Analysis([os.path.join("packaging", entry)], pathex=[ROOT], datas=datas,
+                    hiddenimports=hidden, excludes=excludes, noarchive=False)
+
+
+a_gui = analysis("entry_gui.py")
+a_cli = analysis("entry_cli.py")
+
+exe_gui = EXE(PYZ(a_gui.pure), a_gui.scripts, [], exclude_binaries=True, name=GUI_NAME,
+              console=False, debug=False, strip=False, upx=False, icon=icon)
+exe_cli = EXE(PYZ(a_cli.pure), a_cli.scripts, [], exclude_binaries=True, name=CLI_NAME,
+              console=True, debug=False, strip=False, upx=False, icon=icon)
+
+# 两个可执行文件进同一个目录；COLLECT 会按目标路径去重共用的库
+coll = COLLECT(exe_gui, exe_cli, a_gui.binaries, a_gui.datas, a_cli.binaries, a_cli.datas,
+               strip=False, upx=False, name="LANDrop")
+
+if IS_WIN:
+    # 免安装版（单文件）：双击即用、无需解压。Windows 程序只能二选一当窗口或控制台程序，
+    # 所以单文件版只有窗口；命令行在安装版与 zip 免安装版里。
+    EXE(PYZ(a_gui.pure), a_gui.scripts, a_gui.binaries, a_gui.datas, [], name="LANDrop-portable",
+        console=False, debug=False, strip=False, upx=False, icon=icon)
+
+if IS_MAC:
+    # 第一个 EXE 是 .app 的主程序；命令行也在 Contents/MacOS/ 下，安装包会把它链接到 /usr/local/bin
+    app = BUNDLE(coll, name="LAN Drop.app", icon=icon,
+                 bundle_identifier="io.github.introl-ljl.landrop", version=__version__,
+                 info_plist={
+                     "CFBundleName": "LAN Drop",
+                     "CFBundleDisplayName": "LAN Drop",
+                     "CFBundleShortVersionString": __version__,
+                     "CFBundleVersion": __version__,
+                     "NSHighResolutionCapable": True,
+                     "LSMinimumSystemVersion": "11.0",
+                     "NSRequiresAquaSystemAppearance": False,
+                     "LSApplicationCategoryType": "public.app-category.utilities",
+                     # macOS 15+ 访问局域网前会弹窗询问，这句话会显示在弹窗里
+                     "NSLocalNetworkUsageDescription":
+                         "LAN Drop 需要访问局域网，才能在设备之间直接发送和接收文件。",
+                 })

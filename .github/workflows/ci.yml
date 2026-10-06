@@ -40,28 +40,5 @@ jobs:
         run: python -u tests/gui_check.py
 
   package:
-    name: build check (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install pyinstaller
-      - run: pyinstaller --clean --noconfirm landrop.spec
-      - run: python packaging/build_pyz.py
-      - name: Binaries run
-        shell: bash
-        run: |
-          ls dist
-          if [ -f dist/landrop.exe ]; then BIN=dist/landrop.exe; else BIN=dist/landrop; fi
-          "$BIN" --version
-          python dist/landrop.pyz --version
-      - name: Packaged server end-to-end
-        if: runner.os == 'Linux'
-        run: bash tests/binary_check.sh dist/landrop
+    name: packages
+    uses: ./.github/workflows/build.yml
