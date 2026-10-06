@@ -1,332 +1,388 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""LAN Drop 桌面启动器（Windows / macOS 的图形界面，仅依赖标准库 tkinter）。
+"""LAN Drop 桌面窗口（Windows / macOS / Linux，仅依赖标准库 tkinter）。
 
-Linux 以命令行为主（landrop.py），本窗口在装有 tkinter 的 Linux 上也能用。
+布局参照 LocalSend：左侧导航（发送 / 接收 / 收集服务 / 设置），右侧卡片式内容；
+配色与网页共用一套设计令牌（theme.py），支持浅色 / 深色并跟随系统。
 
-
-职责边界很清楚：它只负责"把服务跑起来并让用户看懂状态"——
-选择数据目录与共享目录、设置端口、启动/停止服务、显示访问地址与管理员密钥、
-提供"打开页面 / 打开目录 / 复制信息"的按钮。网页界面仍然是唯一的操作界面，
-局域网内的参与者继续用浏览器访问，不需要安装任何东西。
-
-命令行仍然完全可用：``python3 server.py --data-dir ...``。
+窗口与命令行是同一个程序的两个入口：安装包里 ``LAN Drop``（窗口）与 ``landrop``（命令行）
+共用一份运行时，``landrop gui`` 也能打开本窗口。
 """
-
 from __future__ import annotations
 
 import os
-import socket
 import sys
-import threading
 import traceback
-import webbrowser
 
-from landrop.common import default_data_dir
-from landrop.server import app as srv
+from landrop import __version__
 
-from . import panels
+from . import system
+from . import widgets as W
+from .theme import T, enable_dpi_awareness, style_titlebar
 
 
-def port_free(port: int) -> bool:
-    s = socket.socket()
-    try:
-        s.bind(("127.0.0.1", port))
-        return True
-    except OSError:
+class LogTee:
+    """把服务端日志（print 到 stdout）同时送到原输出和窗口里的「服务日志」。"""
+
+    def __init__(self, original, sink):
+        self.original, self.sink = original, sink
+        self.encoding = "utf-8"
+
+    def write(self, text):
+        if self.original is not None:
+            try:
+                self.original.write(text)
+            except Exception:  # noqa: BLE001
+                pass
+        if text:
+            self.sink(text)
+        return len(text)
+
+    def flush(self):
+        if self.original is not None:
+            try:
+                self.original.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def isatty(self):
         return False
-    finally:
-        s.close()
+
+
+class NavItem(W.Canvas):
+    """侧边栏导航项：选中时是浮起的白色圆角块，可带状态小圆点。"""
+
+    def __init__(self, parent, icon, text, command):
+        self.icon, self.text, self.command = icon, text, command
+        self.active = self._hover = False
+        self.dot = False
+        self._h = T.px(40)
+        super().__init__(parent, height=self._h, cursor="hand2")
+        self.bind("<Button-1>", lambda e: self.command())
+        self.bind("<Enter>", lambda e: self._sethover(True))
+        self.bind("<Leave>", lambda e: self._sethover(False))
+        self.bind("<Configure>", lambda e: self.draw())
+
+    def _sethover(self, on):
+        self._hover = on
+        self.draw()
+
+    def set(self, active=None, dot=None):
+        if active is not None:
+            self.active = active
+        if dot is not None:
+            self.dot = dot
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        c = T.c
+        bg = W.bg_of(self.master)
+        self.configure(bg=bg)
+        w, h = self.winfo_width(), self._h
+        if w <= 1:
+            return
+        fill = bg
+        if self.active:
+            fill = c["nav_active"]
+            W.rounded(self, 0, 0, w, h, T.px(10), fill, c["line"] if T.mode == "light" else None, 1, bg)
+        elif self._hover:
+            fill = c["hover"]
+            W.rounded(self, 0, 0, w, h, T.px(10), fill, None, 1, bg)
+        fg = c["text"] if self.active else c["text2"]
+        ic = c["accent_text"] if self.active else c["muted"]
+        isz = T.px(18)
+        self.create_image(T.px(12), h // 2, image=W.icon_image(self.icon, isz, ic, fill), anchor="w")
+        self.create_text(T.px(12) + isz + T.px(12), h // 2, text=self.text, fill=fg,
+                         font=T.font(10, "bold" if self.active else "normal"), anchor="w")
+        if self.dot:
+            d = T.px(8)
+            x = w - T.px(16)
+            W.rounded(self, x, (h - d) // 2, x + d, (h - d) // 2 + d, d // 2, c["accent"], None, 1, fill)
+
+    def recolor(self):
+        self.draw()
 
 
 class LauncherApp:
-    """启动器窗口。配置可用环境变量预填，便于脚本与运维：
-
-    ``LANDROP_DATA_DIR`` / ``LANDROP_SHARE_DIR`` / ``LANDROP_PORT`` / ``LANDROP_SCOPE``
+    """主窗口。配置可用环境变量预填（脚本 / 测试用）：
+    ``LANDROP_DATA_DIR`` / ``LANDROP_SHARE_DIR`` / ``LANDROP_PORT`` / ``LANDROP_SCOPE`` / ``LANDROP_URL``
     """
+
+    PAGES = ("send", "receive", "service", "settings")
 
     def __init__(self):
         import tkinter as tk
-        from tkinter import filedialog, messagebox, ttk
+        from . import panels
+        enable_dpi_awareness()
+        self.settings = system.load_settings()
+        T.set_mode(self.settings.get("theme", "system"))
+        self.root = tk.Tk(className="landrop")      # X11 WM_CLASS = ("landrop", "Landrop")，与 .desktop 的 StartupWMClass 对应
+        T.init_tk(self.root)
+        self.root.title("LAN Drop")
+        self.root.configure(bg=T.c["bg"])
+        self.root._roles = {"bg": "bg"}
+        # 初始大小不超过屏幕（小屏 / 高缩放下 1040×720 可能放不下），并居中
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        w, h = min(T.px(1040), sw - T.px(40)), min(T.px(720), sh - T.px(90))
+        self.root.minsize(min(T.px(880), w), min(T.px(600), h))
+        self.root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        self._logos = {}
+        self._set_icon()
+        self.busy: dict[str, bool] = {}
+        self.bridge = panels.UiBridge(self.root)
+        self.toast = W.Toast(self.root)
+        self.service = None
 
-        self.tk = tk
-        self.messagebox = messagebox
-        self.filedialog = filedialog
+        side = W.frame(self.root, bg="sidebar", width=T.px(224))
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        W.frame(self.root, bg="line", width=max(1, T.px(1))).pack(side="left", fill="y")
+        self.content = W.frame(self.root)
+        self.content.pack(side="left", fill="both", expand=True)
 
-        self.root = tk.Tk()
-        self.root.title("LAN Drop · 局域网文件互传与收集")
-        self.root.minsize(680, 520)
-        self.httpd = None
-        self.thread = None
-        self.running = False
-        self.info = None
+        brand = W.frame(side, bg="sidebar")
+        brand.pack(fill="x", padx=T.px(18), pady=(T.px(22), T.px(22)))
+        logo = tk.Label(brand, image=self.logo(32), bd=0, bg=T.c["sidebar"])
+        logo._roles = {"bg": "sidebar"}
+        logo.pack(side="left")
+        bt = W.frame(brand, bg="sidebar")
+        bt.pack(side="left", padx=(T.px(10), 0))
+        W.label(bt, "LAN Drop", size=12, weight="bold", bg="sidebar").pack(anchor="w")
+        W.label(bt, "局域网文件互传", role="muted", size=9, bg="sidebar").pack(anchor="w")
 
-        pad = {"padx": 10, "pady": 6}
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True)
-        main = ttk.Frame(self.notebook, padding=14)
-        self.notebook.add(main, text="收集服务")
-        main.columnconfigure(1, weight=1)
-        row = 0
+        nav = W.frame(side, bg="sidebar")
+        nav.pack(fill="x", padx=T.px(12))
+        self.nav = {}
+        for key, icon, text in (("send", "send", "发送"), ("receive", "download", "接收"),
+                                ("service", "server", "收集服务")):
+            item = NavItem(nav, icon, text, lambda k=key: self.select(k))
+            item.pack(fill="x", pady=T.px(2))
+            self.nav[key] = item
+        bottom = W.frame(side, bg="sidebar")
+        bottom.pack(side="bottom", fill="x", padx=T.px(12), pady=(0, T.px(14)))
+        self.nav["settings"] = NavItem(bottom, "settings", "设置", lambda: self.select("settings"))
+        self.nav["settings"].pack(fill="x", pady=T.px(2))
+        W.label(bottom, f"v{__version__}", role="muted", size=8, bg="sidebar").pack(
+            anchor="w", padx=T.px(12), pady=(T.px(8), 0))
 
-        ttk.Label(main, text="共享目录（对方上传的文件存到这里）").grid(
-            row=row, column=0, sticky="w", **pad)
-        self.share_var = tk.StringVar(value=os.environ.get("LANDROP_SHARE_DIR", ""))
-        ttk.Entry(main, textvariable=self.share_var).grid(row=row, column=1, sticky="ew", **pad)
-        ttk.Button(main, text="选择…", command=self.pick_share).grid(row=row, column=2, **pad)
-        row += 1
-        ttk.Label(main, text="留空 = 数据目录的 files/ 下，按空间名分目录").grid(
-            row=row, column=1, sticky="w", padx=10)
-        row += 1
+        self.send = panels.SendPage(self.content, self)
+        self.receive = panels.ReceivePage(self.content, self)
+        self.service = panels.ServicePage(self.content, self)
+        self.settings_page = panels.SettingsPage(self.content, self)
+        self.pages = {"send": self.send, "receive": self.receive, "service": self.service,
+                      "settings": self.settings_page}
+        self.current = None
 
-        ttk.Label(main, text="数据目录（链接、权限、校验记录）").grid(
-            row=row, column=0, sticky="w", **pad)
-        self.data_var = tk.StringVar(value=os.environ.get("LANDROP_DATA_DIR") or default_data_dir())
-        ttk.Entry(main, textvariable=self.data_var).grid(row=row, column=1, sticky="ew", **pad)
-        ttk.Button(main, text="选择…", command=self.pick_data).grid(row=row, column=2, **pad)
-        row += 1
+        self._stdout = sys.stdout
+        sys.stdout = LogTee(self._stdout, lambda t: self.bridge.call(self.service.append_log, t))
 
-        ttk.Label(main, text="监听端口").grid(row=row, column=0, sticky="w", **pad)
-        self.port_var = tk.StringVar(value=os.environ.get("LANDROP_PORT") or "8000")
-        ttk.Entry(main, textvariable=self.port_var, width=10).grid(
-            row=row, column=1, sticky="w", **pad)
-        row += 1
-
-        ttk.Label(main, text="可访问范围").grid(row=row, column=0, sticky="w", **pad)
-        self.scope_var = tk.StringVar(value=os.environ.get("LANDROP_SCOPE") or "lan")
-        scope = ttk.Frame(main)
-        scope.grid(row=row, column=1, sticky="w", **pad)
-        ttk.Radiobutton(scope, text="局域网（同一 WiFi/网段的设备都能访问）",
-                        variable=self.scope_var, value="lan").pack(anchor="w")
-        ttk.Radiobutton(scope, text="仅本机（只有这台电脑能访问）",
-                        variable=self.scope_var, value="local").pack(anchor="w")
-        row += 1
-
-        self.start_btn = ttk.Button(main, text="启动服务", command=self.toggle)
-        self.start_btn.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        row += 1
-
-        self.status = tk.Text(main, height=15, wrap="word", state="disabled",
-                              font=("Consolas", 10) if sys.platform.startswith("win")
-                              else ("Menlo", 11))
-        self.status.grid(row=row, column=0, columnspan=3, sticky="nsew", **pad)
-        main.rowconfigure(row, weight=1)
-        row += 1
-
-        actions = ttk.Frame(main)
-        actions.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        self.open_btn = ttk.Button(actions, text="打开页面", command=self.open_page, state="disabled")
-        self.open_btn.pack(side="left")
-        self.admin_btn = ttk.Button(actions, text="打开管理面板", command=self.open_admin,
-                                    state="disabled")
-        self.admin_btn.pack(side="left", padx=6)
-        self.folder_btn = ttk.Button(actions, text="打开共享目录", command=self.open_folder,
-                                     state="disabled")
-        self.folder_btn.pack(side="left", padx=6)
-        self.copy_btn = ttk.Button(actions, text="复制访问信息", command=self.copy_info,
-                                   state="disabled")
-        self.copy_btn.pack(side="left", padx=6)
-
-        self.share = panels.SharePanels(
-            self.root, self.notebook,
-            default_url=f"http://127.0.0.1:{self.port_var.get().strip() or '8000'}")
-
-        # 标签顺序：发送 / 接收（直连，主要功能）在前，收集服务在后
-        self.notebook.insert("end", main)
-        self.notebook.select(self.share.send_tab)
-
+        for i, key in enumerate(self.PAGES, 1):
+            self.root.bind_all(f"<Control-Key-{i}>", lambda e, k=key: self.select(k))
+            if sys.platform == "darwin":
+                self.root.bind_all(f"<Command-Key-{i}>", lambda e, k=key: self.select(k))
+        self.root.bind_all("<Control-o>", lambda e: (self.select("send"), self.send.add_files()))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.write("准备就绪。点击「启动服务」开始。\n")
-        self.write("提示：首次启动会生成管理员密钥，用它在管理面板里创建分享链接。\n")
-        self.write("只想把文件发给另一台电脑：用「发送文件」页，不需要启动这里的服务。\n")
+        self.select("send")
+        style_titlebar(self.root, T.mode == "dark")
+        self._enable_drop()
 
-    # ---------------------------------------------------------------- 目录
-    def pick_share(self):
-        d = self.filedialog.askdirectory(title="选择共享目录")
-        if d:
-            self.share_var.set(d)
+    # ------------------------------------------------------------ 外观
+    def _set_icon(self):
+        import tkinter as tk
+        from .icon import PNG
+        try:
+            imgs = [tk.PhotoImage(data="".join(PNG[s])) for s in (16, 32, 48, 64, 128)]
+            self._icon_imgs = imgs
+            self.root.iconphoto(True, *imgs)
+        except tk.TclError:
+            pass
 
-    def pick_data(self):
-        d = self.filedialog.askdirectory(title="选择数据目录")
-        if d:
-            self.data_var.set(d)
+    def logo(self, size):
+        import tkinter as tk
+        from .icon import PNG
+        if size not in self._logos:
+            best = min(PNG, key=lambda s: (s < T.px(size), abs(s - T.px(size))))
+            img = tk.PhotoImage(data="".join(PNG[best]))
+            factor = best // T.px(size)
+            if factor > 1:
+                img = img.subsample(factor)
+            self._logos[size] = img
+        return self._logos[size]
 
-    # ---------------------------------------------------------------- 输出
-    def write(self, text: str):
-        self.status.configure(state="normal")
-        self.status.insert("end", text)
-        self.status.see("end")
-        self.status.configure(state="disabled")
+    def apply_theme(self, pref):
+        T.set_mode(pref)
+        self.root.configure(bg=T.c["bg"])
+        W.recolor_tree(self.root)
+        for item in self.nav.values():
+            item.draw()
+        style_titlebar(self.root, T.mode == "dark")
+        self.save_settings()
 
-    # ---------------------------------------------------------------- 服务
-    def toggle(self):
-        if self.running:
-            self.stop()
-        else:
-            self.start()
+    # ------------------------------------------------------------ 导航与状态
+    def select(self, key):
+        if self.current == key:
+            return
+        if self.current:
+            self.pages[self.current].pack_forget()
+        self.current = key
+        self.pages[key].pack(fill="both", expand=True)
+        for k, item in self.nav.items():
+            item.set(active=(k == key))
+        self.pages[key].on_show()
+
+    def set_busy(self, name, busy):
+        self.busy[name] = busy
+
+    def set_service_state(self, on):
+        if "service" in getattr(self, "nav", {}):
+            self.nav["service"].set(dot=on)
+
+    def notify(self, title, message):
+        """后台完成时提醒：窗口不在前台就响一声并在任务栏闪烁（Windows）。"""
+        self.toast.show(f"{title}：{message}" if len(message) < 40 else title, "ok", 3500)
+        try:
+            if self.root.focus_displayof() is None:
+                self.root.bell()
+                if sys.platform.startswith("win"):
+                    import ctypes
+                    hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+                    ctypes.windll.user32.FlashWindow(hwnd, True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def save_settings(self):
+        s = dict(self.settings)
+        s.update(theme=T.pref, send_mode=self.send.mode.get(), timeout=self.send.timeout.get(),
+                 receivers=self.send.receivers.get(), expire=self.send.expire.get(),
+                 max_downloads=self.send.max_dl.get(), recv_dir=self.receive.dir.get(),
+                 overwrite=bool(self.receive.overwrite.get()))
+        url = self.send.url.get().strip()
+        if url and not (self.service.running and self.service.info and url == self.service.info["local_url"]):
+            s["server_url"] = url
+        if not os.environ.get("LANDROP_PORT"):
+            s.update(port=self.service.port.get(), scope=self.service.scope.get(),
+                     share_dir=self.service.share_dir.get(), service_address=self.service.address.get())
+        if not os.environ.get("LANDROP_DATA_DIR"):
+            s["data_dir"] = self.service.data_dir.get()
+        self.settings = s
+        system.save_settings(s)
+
+    # ------------------------------------------------------------ 拖放（Windows）
+    def _enable_drop(self):
+        if not sys.platform.startswith("win") or os.environ.get("LANDROP_NO_DND"):
+            return
+        try:
+            from . import windrop
+            windrop.enable(self.root, lambda paths: self.bridge.call(self._dropped, paths))
+            self.send.drop_hint.configure(text="把文件或文件夹拖进窗口，或点下面的按钮选择")
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+    def _dropped(self, paths):
+        self.select("send")
+        if self.send.busy:
+            self.toast.show("正在发送，完成后再添加", "info")
+            return
+        self.send.reset()
+        self.send.add_paths(paths)
+        self.toast.show(f"已添加 {len(paths)} 项")
+
+    # ------------------------------------------------------------ 兼容：自检与旧调用
+    @property
+    def running(self):
+        return self.service.running
+
+    @property
+    def info(self):
+        return self.service.info
 
     def start(self):
-        data_dir = self.data_var.get().strip() or default_data_dir()
-        share_dir = self.share_var.get().strip()
-        try:
-            port = int(self.port_var.get().strip() or "8000")
-        except ValueError:
-            self.messagebox.showerror("端口无效", "端口必须是数字。")
-            return
-        if not port_free(port):
-            self.messagebox.showerror("端口被占用", f"端口 {port} 已被占用，换一个端口再试。")
-            return
-        host = "127.0.0.1" if self.scope_var.get() == "local" else "0.0.0.0"
-        if share_dir:
-            try:
-                os.makedirs(share_dir, exist_ok=True)
-            except OSError as exc:
-                self.messagebox.showerror("目录不可写", f"{share_dir}\n{exc}")
-                return
-        try:
-            self.info = srv.prepare(
-                data_dir=data_dir, share_dir=share_dir, host=host, port=port,
-            )
-            self.httpd = srv.make_server(host, port)
-        except Exception as exc:  # noqa: BLE001
-            self.messagebox.showerror("启动失败", f"{exc}\n\n{traceback.format_exc(limit=3)}")
-            return
-
-        self.thread = threading.Thread(target=self._serve, daemon=True)
-        self.thread.start()
-        self.running = True
-        self.start_btn.configure(text="停止服务")
-        for b in (self.open_btn, self.admin_btn, self.folder_btn, self.copy_btn):
-            b.configure(state="normal")
-
-        info = self.info
-        key = info["admin_key"]
-        if not key:
-            try:
-                with open(info["admin_key_file"], encoding="utf-8") as f:
-                    key = f.read().strip()
-            except OSError:
-                key = ""
-        self.share.set_local_service(info["local_url"], key)
-        self.write("\n" + "=" * 58 + "\n")
-        self.write("  LAN Drop 已启动\n")
-        self.write("=" * 58 + "\n")
-        self.write(f"  访问地址 : {info['url']}\n")
-        self.write(f"  本机访问 : {info['local_url']}\n")
-        self.write(f"  管理面板 : {info['local_url']}/admin\n")
-        self.write(f"  共享目录 : {info['share_dir']}\n")
-        self.write(f"  数据目录 : {info['data_dir']}\n")
-        if info["admin_key"]:
-            self.write(f"  管理员密钥: {info['admin_key']}\n")
-            self.write("     （已保存到数据目录的 admin-key.txt，可随时找回）\n")
-        else:
-            self.write(f"  管理员密钥: 见 {info['admin_key_file']}\n")
-        self.write("=" * 58 + "\n")
-        if info.get("import_report"):
-            rep = info["import_report"]
-            self.write(f"  导入：成功 {len(rep['imported'])}，失败 {len(rep['failed'])}\n")
-        if host == "0.0.0.0":
-            self.write("  把上面的「访问地址」发给同一局域网的人即可开始收集。\n")
-            self.write("  首次启动若系统弹出防火墙提示，请选择「允许访问」。\n")
-        else:
-            self.write("  当前仅本机可访问；需要局域网共享请选择「局域网」。\n")
-
-    def _serve(self):
-        try:
-            self.httpd.serve_forever()
-        except Exception as exc:  # noqa: BLE001
-            msg = f"\n服务异常：{exc!r}\n"      # 先取值：except 结束后 exc 会被删除，lambda 里再用会 NameError
-            self.root.after(0, lambda: self.write(msg))
+        self.service.start()
 
     def stop(self):
-        if self.httpd:
-            try:
-                self.httpd.shutdown()
-                self.httpd.server_close()
-            except Exception:  # noqa: BLE001
-                pass
-        self.httpd = None
-        self.running = False
-        self.start_btn.configure(text="启动服务")
-        for b in (self.open_btn, self.admin_btn, self.folder_btn, self.copy_btn):
-            b.configure(state="disabled")
-        self.write("\n服务已停止。已上传的文件与链接都保留在数据目录中，下次启动继续可用。\n")
+        self.service.stop()
 
-    # ---------------------------------------------------------------- 动作
-    def open_page(self):
-        if self.info:
-            webbrowser.open(self.info["local_url"])
-
-    def open_admin(self):
-        if self.info:
-            webbrowser.open(self.info["local_url"] + "/admin")
-
-    def open_folder(self):
-        if not self.info:
-            return
-        path = self.info["share_dir"]
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(path)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                import subprocess
-                subprocess.Popen(["open", path])
-            else:
-                import subprocess
-                subprocess.Popen(["xdg-open", path])
-        except Exception as exc:  # noqa: BLE001
-            self.messagebox.showinfo("共享目录", f"{path}\n\n（无法自动打开：{exc}）")
-
-    def copy_info(self):
-        if not self.info:
-            return
-        text = (f"访问地址：{self.info['url']}\n"
-                f"管理面板：{self.info['local_url']}/admin\n")
-        if self.info["admin_key"]:
-            text += f"管理员密钥：{self.info['admin_key']}\n"
-        else:
-            text += f"管理员密钥见：{self.info['admin_key_file']}\n"
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self.write("\n已把访问信息复制到剪贴板。\n")
-
+    # ------------------------------------------------------------ 退出
     def on_close(self):
-        if self.running:
-            if not self.messagebox.askokcancel("退出", "服务正在运行，退出会停止服务。\n"
-                                                     "已上传的文件与链接都会保留。确定退出？"):
+        from tkinter import messagebox
+        jobs = [n for n, b in self.busy.items() if b]
+        if self.service.running:
+            jobs.append("service")
+        if jobs:
+            what = {"send": "正在发送", "receive": "正在接收", "service": "收集服务正在运行"}
+            text = "、".join(what[j] for j in jobs)
+            if not messagebox.askokcancel("退出 LAN Drop", f"{text}，退出会中断。\n"
+                                          "已上传的文件与链接都会保留。确定退出？", parent=self.root):
                 return
-            self.stop()
-        self.share.shutdown()
+        self.save_settings()
+        self.send.shutdown()
+        self.receive.shutdown()
+        if self.service.running:
+            self.service.stop()
+        sys.stdout = self._stdout
         self.root.destroy()
 
     def run(self):
         self.root.mainloop()
 
 
+def _ensure_streams():
+    """窗口版（PyInstaller --windowed）没有控制台，sys.stdout/stderr 是 None，
+    服务端日志里的 print 会直接抛异常；换成空设备。"""
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
+def smoke_test(app) -> int:
+    """打包产物自检：每个页面都能显示、两种主题都能切换、服务能启动并响应、能正常停止。"""
+    import urllib.request
+    for key in app.PAGES:
+        app.select(key)
+        app.root.update()
+    app.apply_theme("dark")
+    app.root.update()
+    app.apply_theme("light")
+    app.root.update()
+    app.start()
+    if not app.running:
+        return 1
+    with urllib.request.urlopen(app.info["local_url"] + "/", timeout=10) as r:
+        ok = r.status == 200 and b"LAN Drop" in r.read()
+    app.root.update()
+    app.stop()
+    app.root.update()
+    return 0 if ok else 1
+
+
 def main(argv=None):
+    _ensure_streams()
     try:
         import tkinter  # noqa: F401
     except ImportError:
-        print("未检测到 tkinter。请安装带 tkinter 的 Python，或改用命令行：\n"
-              "  python3 server.py --data-dir ./data", file=sys.stderr)
+        print("未检测到 tkinter。请安装带 tkinter 的 Python，或改用命令行：landrop --help",
+              file=sys.stderr)
         return 2
     import argparse
-    ap = argparse.ArgumentParser(description="LAN Drop 桌面启动器")
+    ap = argparse.ArgumentParser(prog="landrop gui", description="LAN Drop 桌面窗口")
     ap.add_argument("--autostart", action="store_true",
-                    help="打开窗口后立即启动服务（适合开机自启）")
-    ap.add_argument("--no-window", action="store_true",
-                    help="不开窗口，只按环境变量启动服务（等价于 server.py）")
-    args = ap.parse_args(argv)
-
-    if args.no_window:
-        return srv.main(["--data-dir", os.environ.get("LANDROP_DATA_DIR") or default_data_dir(),
-                         "--host", "127.0.0.1" if os.environ.get("LANDROP_SCOPE") == "local"
-                         else "0.0.0.0",
-                         "--port", os.environ.get("LANDROP_PORT") or "8000"])
+                    help="打开窗口后立即启动收集服务（适合开机自启）")
+    ap.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
+    args, _unknown = ap.parse_known_args(argv)     # macOS 从 Finder 启动可能带 -psn_… 参数
 
     app = LauncherApp()
+    if args.smoke_test:
+        try:
+            return smoke_test(app)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            return 1
+        finally:
+            sys.stdout = app._stdout
+            app.root.destroy()
     if args.autostart:
-        app.root.after(300, app.start)
+        app.root.after(300, lambda: (app.select("service"), app.start()))
     app.run()
     return 0
 

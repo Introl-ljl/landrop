@@ -26,6 +26,8 @@ import threading
 import time
 import unicodedata
 
+from landrop.common import merge_ranges
+
 PBKDF2_ROUNDS = 120_000            # 人类口令的派生轮数
 SESSION_TTL = 7 * 86400            # 会话有效期（秒）
 VISITOR_TTL = 400 * 86400          # 访客 Cookie 有效期（秒）
@@ -105,11 +107,21 @@ CREATE TABLE IF NOT EXISTS uploads (
   created_at    REAL NOT NULL,
   updated_at    REAL NOT NULL
 );
-CREATE TABLE IF NOT EXISTS fetch_progress (
-  grant_id TEXT NOT NULL,
-  file_id  TEXT NOT NULL,
-  bytes    INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (grant_id, file_id)
+CREATE TABLE IF NOT EXISTS fetch_ranges (
+  grant_id   TEXT NOT NULL REFERENCES grants(id) ON DELETE CASCADE,
+  visitor_id TEXT NOT NULL REFERENCES visitors(id) ON DELETE CASCADE,
+  file_id    TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  ranges     TEXT NOT NULL,
+  PRIMARY KEY (grant_id, visitor_id, file_id)
+);
+CREATE TABLE IF NOT EXISTS upload_receipts (
+  id         TEXT PRIMARY KEY,
+  space_id   TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+  visitor_id TEXT NOT NULL,
+  grant_id   TEXT NOT NULL,
+  file_id    TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  receipt    TEXT NOT NULL,
+  created_at REAL NOT NULL
 );
 """
 
@@ -165,6 +177,16 @@ def safe_stored_name(name: str) -> str:
         keep = 220 - len(ext.encode("utf-8"))
         name = stem.encode("utf-8")[: max(keep, 1)].decode("utf-8", "ignore") + ext
     return name
+
+
+def safe_rel_name(rel: str) -> str:
+    """文件夹里的相对路径（如 ``相册/2024/a.jpg``）：逐段清洗后用 / 连接，作为显示名。
+    磁盘上仍按清洗后的文件名平铺存放，相对路径只用于展示和接收端还原目录结构。
+    含 ``..`` 或清洗后为空时抛 ValueError。"""
+    parts = [p for p in (rel or "").replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts) or len(parts) > 32:
+        raise ValueError("bad path")
+    return "/".join(safe_stored_name(p) for p in parts)
 
 
 def file_sha256(path: str) -> str:
@@ -327,7 +349,8 @@ class Store:
         """临时空间 + 只读授权：到期/用完/撤销后由 cleanup_transfers 连文件一起清理。
         返回 (grant_row, 明文令牌, space_id)。"""
         sid = self.create_space("transfer-" + secrets.token_hex(3))
-        self._write("UPDATE spaces SET transient=1 WHERE id=?", (sid,))
+        # 目录名保持 transfer-xxxx；显示名用备注（浏览器打开文件码时看到的是「报告.pdf, 相册」而不是内部名）
+        self._write("UPDATE spaces SET transient=1, name=? WHERE id=?", ((label or "一次性传输")[:60], sid))
         row, secret = self.create_grant(kind="share", space_id=sid, perm="read", mode="token",
                                         label=label, expires_at=expires_at)
         if max_downloads:
@@ -341,28 +364,43 @@ class Store:
             g = self.get_grant(grant_id)
         return bool(g and g["max_downloads"] is not None and g["downloads"] >= g["max_downloads"])
 
-    def record_fetch_bytes(self, grant_id: str, file_id: str, file_size: int, nbytes: int) -> bool:
-        """按服务端实际下发的字节统计一次性传输：某授权取齐空间内全部文件（每个文件的
-        累计下发字节都达到登记大小）才计一次完整取件。返回是否已用完次数。
-
-        不依赖接收端上报 /api/done，浏览器取件同样计入；只取部分文件（--only）不会误耗配额。
-        """
-        with self._write_lock:
-            self._write(
-                "INSERT INTO fetch_progress(grant_id,file_id,bytes) VALUES(?,?,?) "
-                "ON CONFLICT(grant_id,file_id) DO UPDATE SET bytes=bytes+excluded.bytes",
-                (grant_id, file_id, max(0, int(nbytes))),
-            )
-            done = self._one(
-                "SELECT COUNT(*) AS n FROM fetch_progress fp JOIN files f ON f.id=fp.file_id "
-                "WHERE fp.grant_id=? AND f.status='active' AND fp.bytes>=f.size", (grant_id,))
-            total = self._one(
-                "SELECT COUNT(*) AS n FROM files WHERE status='active' AND space_id="
-                "(SELECT space_id FROM grants WHERE id=?)", (grant_id,))
-            if not total["n"] or done["n"] < total["n"]:
+    def record_fetch_range(self, grant_id: str, visitor_id: str, file_id: str,
+                           start: int, stop: int) -> bool:
+        """Count a pickup only when one visitor has covered every file in the batch."""
+        with self._write_lock, self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            file = self.get_file(file_id)
+            if file is None or not self.grant_state(grant_id)[0]:
                 return False
-            self._write("DELETE FROM fetch_progress WHERE grant_id=?", (grant_id,))
+            start, stop = max(0, start), min(stop, file["size"])
+            if stop <= start and file["size"]:
+                return False
+            previous = self._one(
+                "SELECT ranges FROM fetch_ranges WHERE grant_id=? AND visitor_id=? AND file_id=?",
+                (grant_id, visitor_id, file_id))
+            ranges = merge_ranges(json.loads(previous["ranges"]) if previous else [], start, stop)
+            self._write(
+                "INSERT INTO fetch_ranges(grant_id,visitor_id,file_id,ranges) VALUES(?,?,?,?) "
+                "ON CONFLICT(grant_id,visitor_id,file_id) DO UPDATE SET ranges=excluded.ranges",
+                (grant_id, visitor_id, file_id, json.dumps(ranges)),
+            )
+            files = self._query(
+                "SELECT f.size, fp.ranges FROM files f LEFT JOIN fetch_ranges fp ON "
+                "fp.file_id=f.id AND fp.grant_id=? AND fp.visitor_id=? "
+                "WHERE f.status='active' AND f.space_id=(SELECT space_id FROM grants WHERE id=?)",
+                (grant_id, visitor_id, grant_id))
+            if not files or any(r["ranges"] is None or
+                                json.loads(r["ranges"]) != ([[0, r["size"]]] if r["size"] else [])
+                                for r in files):
+                return False
+            self._write("DELETE FROM fetch_ranges WHERE grant_id=? AND visitor_id=?",
+                        (grant_id, visitor_id))
             return self.record_download(grant_id)
+
+    def get_fetch_ranges(self, grant_id: str, visitor_id: str, file_id: str):
+        row = self._one("SELECT ranges FROM fetch_ranges WHERE grant_id=? AND visitor_id=? AND file_id=?",
+                        (grant_id, visitor_id, file_id))
+        return json.loads(row["ranges"]) if row else []
 
     def list_transfers(self):
         rows = self._query(
@@ -555,7 +593,9 @@ class Store:
                 except OSError:
                     pass
             self._write("DELETE FROM uploads WHERE updated_at<?", (ts - 3 * 86400,))
-            self._write("DELETE FROM fetch_progress WHERE grant_id NOT IN (SELECT id FROM grants)")
+            if self._one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fetch_progress'"):
+                self._write("DELETE FROM fetch_progress WHERE grant_id NOT IN (SELECT id FROM grants)")
+            self._write("DELETE FROM upload_receipts WHERE created_at<?", (ts - SESSION_TTL,))
 
     def purge_orphan_parts(self, min_age: float = 600) -> int:
         """清理 partial/ 下没有对应上传会话的分块文件（进程中断、传输被清理等留下的孤儿）。
@@ -685,6 +725,16 @@ class Store:
 
     def drop_upload(self, upload_id: str):
         self._write("DELETE FROM uploads WHERE id=?", (upload_id,))
+
+    def get_upload_receipt(self, upload_id: str):
+        return self._one("SELECT * FROM upload_receipts WHERE id=?", (upload_id,))
+
+    def save_upload_receipt(self, upload, receipt):
+        self._write(
+            "INSERT INTO upload_receipts(id,space_id,visitor_id,grant_id,file_id,receipt,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (upload["id"], upload["space_id"], upload["visitor_id"], upload["grant_id"],
+             receipt["id"], json.dumps(receipt), now()))
 
     def part_path(self, upload_id: str) -> str:
         return os.path.join(self.partial_dir, upload_id + ".part")

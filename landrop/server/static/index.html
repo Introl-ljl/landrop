@@ -1888,8 +1888,16 @@ $("#copyBtn").addEventListener("click", async () => {
 });
 
 /* ---------- 启动 ---------- */
+let presetFromCode = false;
 function keyFromUrl(){
-  // 分享链接形如 /#k=<密钥>；读完后立刻从地址栏抹掉，避免残留在历史记录里
+  // 分享链接形如 /#k=<密钥>；文件码形如 地址/<令牌>，浏览器直接打开时令牌在路径里。
+  // 读完后立刻从地址栏抹掉，避免残留在历史记录里
+  const p = /^\/([A-Za-z0-9_-]{16,64})\/?$/.exec(location.pathname);
+  if(p){
+    presetFromCode = true;
+    try{ history.replaceState(null, "", "/"); }catch(e){}
+    return p[1];
+  }
   const h = location.hash || "";
   const m = /[#&]k=([^&]+)/.exec(h);
   if(!m) return "";
@@ -1907,6 +1915,22 @@ function keyFromUrl(){
     if(r.status === 200) me = await r.json();
   }catch(e){}
   document.body.classList.remove("booting");
+  if(me && me.logged_in && presetFromCode){
+    // 已登录但打开的是新的文件码：直接换成这个文件码的身份（取件意图明确）
+    try{
+      const r = await api("/api/login", {method:"POST", headers:{"Content-Type":"application/json"},
+                                         body: JSON.stringify({key: preset})});
+      if(r.ok) me = {logged_in: true};
+      else me = null;
+    }catch(e){ me = null; }
+    if(!me){ showGate(); loginError("文件码无效、已过期或已被取完"); return; }
+    try{
+      const r2 = await api("/api/files");
+      if(r2.status === 200) data = await r2.json();
+    }catch(e){}
+    startApp(data && data.ok ? data : null);
+    return;
+  }
   if(me && me.logged_in){
     try{
       const r2 = await api("/api/files");
@@ -1920,7 +1944,13 @@ function keyFromUrl(){
   if(preset){
     $("#keyInput").value = preset;
     setLoginState("idle");
-    toast("已从链接填入密钥，点击「进入」即可开始", "info");
+    if(presetFromCode){            // 文件码：直接取件，不用再点一次
+      const form = $("#loginForm");
+      if(form.requestSubmit) form.requestSubmit();
+      else form.dispatchEvent(new Event("submit", {cancelable:true}));
+    }else{
+      toast("已从链接填入密钥，点击「进入」即可开始", "info");
+    }
   }
 })();
 </script>

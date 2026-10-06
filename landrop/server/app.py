@@ -38,6 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
 from landrop import __version__ as VERSION
+from landrop.common import resolve_data_dir, setup_console
 
 from . import store as store_mod
 from .store import Store
@@ -68,6 +69,7 @@ _attempts: dict = {}
 _attempts_lock = threading.Lock()
 _upload_locks: dict = {}
 _upload_locks_lock = threading.Lock()
+TOKEN_PATH = re.compile(r"/([A-Za-z0-9_-]{16,64})/?")
 
 
 def log(msg: str) -> None:
@@ -351,10 +353,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/" and method in ("GET", "HEAD"):
                 return self.serve_static("index.html")
             if method in ("GET", "HEAD"):
-                # 反斜杠在 Windows 上是路径分隔符：先归一成 "/" 再检查，否则 ..\..\ 能绕过
                 rel = path.lstrip("/").replace("\\", "/")
-                if (rel and ".." not in rel.split("/")
-                        and all(ord(c) >= 32 for c in rel)):
+                if rel and ".." not in rel.split("/") and all(ord(c) >= 32 for c in rel):
+                    if (TOKEN_PATH.fullmatch(path)
+                            and not os.path.isfile(os.path.join(resource_dir(), rel))):
+                        # 文件码 = 地址/令牌：浏览器直接打开也能取件（网页从路径读出令牌并自动登录）
+                        return self.serve_static("index.html", private=True)
                     return self.serve_static(rel)
             self._drain_body()
             self._err(HTTPStatus.NOT_FOUND, "not found")
@@ -370,13 +374,11 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     # ------------------------------------------------------------ 静态
-    def serve_static(self, rel: str):
+    def serve_static(self, rel: str, private: bool = False):
         base = os.path.realpath(resource_dir())
-        # 兜底：无论上层检查如何，解析后的真实路径必须仍在静态目录内（含盘符/UNC 等形态）
         full = os.path.realpath(os.path.join(base, rel))
         if full != base and not full.startswith(base + os.sep):
-            self._err(HTTPStatus.NOT_FOUND, "not found")
-            return
+            return self._err(HTTPStatus.NOT_FOUND, "not found")
         if not os.path.isfile(full):
             self._err(HTTPStatus.NOT_FOUND, "not found")
             return
@@ -388,7 +390,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(size))
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-store" if private else "no-cache")
+        if private:                     # 地址里带令牌：不让它经 Referer 泄露给页面外的请求
+            self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         if self.command != "HEAD":
             with open(full, "rb") as f:
@@ -433,6 +437,7 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "kind": grant["kind"],
+                "range_progress": True,
                 "perm": grant["perm"],
                 "label": grant["label"],
                 "capabilities": CAPS["admin"] if grant["kind"] == "admin" else CAPS[grant["perm"]],
@@ -581,6 +586,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(HTTPStatus.BAD_REQUEST, "Content-Length 不合法")
 
         name = store_mod.safe_stored_name(raw_name)
+        raw_path = (qs.get("path") or [""])[0]
+        if raw_path:                    # 文件夹上传：显示名带相对路径，接收端据此还原目录
+            try:
+                name = store_mod.safe_rel_name(raw_path)
+            except ValueError:
+                self._drain_body()
+                return self._err(HTTPStatus.BAD_REQUEST, "path 不合法")
         space_id = self._space_for(auth, parsed)
         if space_id is None:
             self._drain_body()
@@ -591,6 +603,17 @@ class Handler(BaseHTTPRequestHandler):
 
         lock = get_upload_lock(safe_id)
         with lock:
+            completed = STORE.get_upload_receipt(safe_id)
+            if completed is not None:
+                self._drain_body()
+                if (completed["visitor_id"] != visitor or completed["grant_id"] != grant_id
+                        or completed["space_id"] != space_id):
+                    return self._err(HTTPStatus.FORBIDDEN, "该上传会话不属于当前身份")
+                receipt = json.loads(completed["receipt"])
+                if (receipt["name"] != name or (total is not None and receipt["size"] != total)
+                        or (expect and receipt["sha256"] != expect)):
+                    return self._err(HTTPStatus.CONFLICT, "上传 id 已用于其他文件")
+                return self._send_json(receipt)
             row = STORE.get_upload(safe_id)
             if row is None:
                 if offset != 0:
@@ -672,7 +695,7 @@ class Handler(BaseHTTPRequestHandler):
             }, status=HTTPStatus.UNPROCESSABLE_ENTITY)
 
         auth_space = STORE.get_upload(upload_id)["space_id"]
-        stored = STORE.unique_stored_name(auth_space, name)
+        stored = STORE.unique_stored_name(auth_space, store_mod.safe_stored_name(name))
         final = os.path.join(STORE.space_dir(auth_space), stored)
         try:
             os.replace(part, final)
@@ -691,10 +714,7 @@ class Handler(BaseHTTPRequestHandler):
             owner_visitor=row["visitor_id"],
             owner_grant=row["grant_id"],
         )
-        STORE.drop_upload(upload_id)
-        drop_upload_lock(upload_id)
-        log(f"上传完成  <- {self._client_ip()}  {stored}  ({human_size(size)})  sha256={actual[:12]}…")
-        self._send_json({
+        receipt = {
             "ok": True,
             "complete": True,
             "id": fid,
@@ -703,7 +723,12 @@ class Handler(BaseHTTPRequestHandler):
             "size": size,
             "sha256": actual,
             "verified": bool(expect),
-        })
+        }
+        STORE.save_upload_receipt(row, receipt)
+        STORE.drop_upload(upload_id)
+        drop_upload_lock(upload_id)
+        log(f"上传完成  <- {self._client_ip()}  {stored}  ({human_size(size)})  sha256={actual[:12]}…")
+        self._send_json(receipt)
 
     def _cleanup_upload(self, upload_id):
         try:
@@ -769,6 +794,11 @@ class Handler(BaseHTTPRequestHandler):
         if row is None:
             return self._err(HTTPStatus.NOT_FOUND if "不存在" in why else HTTPStatus.FORBIDDEN, why)
 
+        if qs.get("progress") == ["1"]:
+            ranges = (STORE.get_fetch_ranges(auth["grant"]["id"], auth["visitor"]["id"], row["id"])
+                      if self._transfer_grant(auth) is not None else [[0, row["size"]]])
+            return self._send_json({"ok": True, "ranges": ranges})
+
         full = STORE.file_path(row)
         if not os.path.isfile(full):
             return self._err(HTTPStatus.NOT_FOUND, "文件已不在磁盘上")
@@ -813,7 +843,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(length))
         self.send_header("Content-Disposition",
-                         f"{disposition}; {self._content_disposition(row['display_name'])}")
+                         f"{disposition}; "
+                         f"{self._content_disposition(row['display_name'].rsplit('/', 1)[-1])}")
         self.send_header("Accept-Ranges", "bytes")
         if row["sha256"]:
             self.send_header("X-File-SHA256", row["sha256"])
@@ -822,31 +853,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command == "HEAD":
             return
-        if not size:
-            self._count_transfer_bytes(auth, row, 0)
-            return
-        with open(full, "rb") as f:
-            f.seek(start)
-            left = length
-            while left > 0:
-                chunk = f.read(min(CHUNK_SIZE, left))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                left -= len(chunk)
-        self._count_transfer_bytes(auth, row, length - left)
-
-    def _count_transfer_bytes(self, auth, row, served: int):
-        """一次性传输的服务端取件计数：按实际下发字节累计，取齐全部文件即消耗一次配额。
-        不依赖客户端上报 /api/done，浏览器取件同样计入。"""
-        g = auth["grant"]
-        if g["kind"] != "share":
-            return
-        space = STORE.get_space(row["space_id"])
-        if space is None or not space["transient"]:
-            return
-        if STORE.record_fetch_bytes(g["id"], row["id"], row["size"] or 0, served):
-            log(f"传输取件次数已用完（按字节统计）  <- {self._client_ip()}  {g['id']}")
+        left = length
+        try:
+            if size:
+                with open(full, "rb") as f:
+                    f.seek(start)
+                    while left > 0:
+                        chunk = f.read(min(CHUNK_SIZE, left))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        left -= len(chunk)
+        finally:
+            # Successful writes still count when a later write loses the connection.
+            if self._transfer_grant(auth) is not None:
+                if STORE.record_fetch_range(auth["grant"]["id"], auth["visitor"]["id"], row["id"],
+                                            start, start + length - left):
+                    log(f"传输取件次数已用完  <- {self._client_ip()}  {auth['grant']['id']}")
 
     @staticmethod
     def _inline_ok(ctype: str) -> bool:
@@ -1085,9 +1108,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json({"ok": True, "transfers": STORE.list_transfers()})
 
+    def _transfer_grant(self, auth):
+        g = auth["grant"]
+        space = STORE.get_space(g["space_id"]) if g["space_id"] else None
+        return g if space is not None and space["transient"] else None
+
     def api_done(self):
-        """接收端完成信号。直连发送端据此结束监听；一次性传输的次数由服务端按实际下发
-        字节统计（见 _count_transfer_bytes），这里不再计数，仅保持协议兼容。"""
+        """Compatibility signal only; pickup quotas are enforced from served byte ranges."""
         auth = self._auth()
         self._drain_body()
         if auth is None:
@@ -1149,8 +1176,9 @@ def parse_args(argv=None):
             "  landrop serve --data-dir ./data --admin-key '我的管理密钥'\n"
         ),
     )
-    p.add_argument("--data-dir", default=os.path.join(os.getcwd(), "data"),
-                   help="数据目录：state.sqlite3 / files / partial / trash（默认 ./data）")
+    p.add_argument("--data-dir", default=None,
+                   help="数据目录：state.sqlite3 / files / partial / trash（默认与桌面窗口相同的"
+                        "系统数据目录；也可用环境变量 LANDROP_DATA_DIR）")
     p.add_argument("--dir", default="",
                    help="把默认空间的共享目录放到指定位置（默认 <data-dir>/files/<空间名>）")
     p.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
@@ -1173,8 +1201,17 @@ def parse_args(argv=None):
     return args
 
 
+_janitor_started = False
+
+
 def _start_janitor(interval: float = 60.0):
-    """后台清理：过期会话与失效的一次性传输（连磁盘文件一起删）。"""
+    """后台清理：过期会话与失效的一次性传输（连磁盘文件一起删）。
+    进程内只启动一个：桌面窗口反复启停服务时不会越积越多（它总是清理当前的 STORE）。"""
+    global _janitor_started
+    if _janitor_started:
+        return
+    _janitor_started = True
+
     def loop():
         while True:
             time.sleep(interval)
@@ -1212,7 +1249,8 @@ def prepare(data_dir: str, share_dir: str = "", space_name: str = "共享空间"
 
     # 容器内看到的网卡地址不是宿主机地址，允许用 --public-url / LANDROP_PUBLIC_URL 指定
     public = (public_url or os.environ.get("LANDROP_PUBLIC_URL") or "").strip()
-    PUBLIC_URL = (public or f"http://{local_ip()}:{port}").rstrip("/")
+    loopback = host in ("127.0.0.1", "localhost", "::1")    # 仅本机：链接里不能写局域网地址
+    PUBLIC_URL = (public or f"http://{'127.0.0.1' if loopback else local_ip()}:{port}").rstrip("/")
 
     created_key = None
     admin = STORE.admin_grant()
@@ -1277,20 +1315,14 @@ def banner(info: dict):
     print(line, flush=True)
 
 
-def _force_utf8_output():
-    """Windows 管道/旧代码页下 print 中文会抛 UnicodeEncodeError：统一成 UTF-8。"""
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:  # noqa: BLE001
-            pass
-
-
 def main(argv=None):
-    _force_utf8_output()
+    setup_console()
     args = parse_args(argv)
+    data_dir, source = resolve_data_dir(args.data_dir)
+    if source not in ("参数", "LANDROP_DATA_DIR"):
+        log(f"数据目录：{data_dir}（{source}；可用 --data-dir 指定）")
     info = prepare(
-        data_dir=args.data_dir, share_dir=args.dir, space_name=args.space,
+        data_dir=data_dir, share_dir=args.dir, space_name=args.space,
         admin_key=args.admin_key, reset_admin=args.reset_admin,
         import_dir=args.import_dir, import_recursive=args.import_recursive,
         host=args.host, port=args.port, public_url=args.public_url,

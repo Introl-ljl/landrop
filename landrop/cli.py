@@ -6,7 +6,7 @@
     landrop serve [--data-dir …]   在本机启动收集服务（网页 + CLI）
     landrop send --server URL …    上传到常驻服务，生成一次性取件码
     landrop revoke <ID>            撤销一个传输/分享
-    landrop gui                    桌面窗口（Windows / macOS）
+    landrop gui                    打开桌面窗口（与安装包里的 LAN Drop 是同一个程序）
 """
 from __future__ import annotations
 
@@ -16,10 +16,10 @@ import os
 import sys
 
 from . import __version__
-from .common import (CliError, human, make_code, normalize_base, progress, progress_end,
-                     setup_console, cmd_prefix)
+from .common import (CliError, collect_entries, human, make_code, normalize_base, progress,
+                     progress_end, setup_console, cmd_prefix)
 from .direct import DirectSender, lan_addresses
-from .remote import (Client, fetch_files, list_remote, read_admin_key, send_files)
+from .remote import fetch_files, list_remote, read_admin_key, revoke, send_files
 
 DEFAULT_URL = "http://127.0.0.1:8000"
 
@@ -34,7 +34,7 @@ def find_admin_key(args) -> str:
 
 def pick_interactively() -> list[str]:
     if not sys.stdin.isatty():
-        raise CliError("没有指定文件。用法：landrop.py send 文件1 [文件2 ...]")
+        raise CliError(f"没有指定文件。用法：{cmd_prefix()} send 文件或文件夹 [...]")
     files = sorted(p for p in os.listdir(".") if os.path.isfile(p))
     if not files:
         raise CliError("当前目录没有文件可选")
@@ -61,7 +61,7 @@ def pick_interactively() -> list[str]:
     return chosen
 
 
-def expand_paths(items: list[str], allow_dirs: bool = False) -> list[str]:
+def expand_paths(items: list[str]) -> list[str]:
     out: list[str] = []
     for item in items:
         item = os.path.expanduser(item)
@@ -73,8 +73,6 @@ def expand_paths(items: list[str], allow_dirs: bool = False) -> list[str]:
         if not matches:
             raise CliError(f"没有匹配：{item}")
         for m in matches:
-            if os.path.isdir(m) and not allow_dirs:
-                raise CliError(f"{m} 是目录；请先打包（如 tar/zip）或用通配符选文件")
             if not (os.path.isfile(m) or os.path.isdir(m)):
                 raise CliError(f"文件不存在：{m}")
             ap = os.path.abspath(m)
@@ -83,10 +81,25 @@ def expand_paths(items: list[str], allow_dirs: bool = False) -> list[str]:
     return out
 
 
+def print_code(code: str, qr: bool = False):
+    """send 的输出：文件码、取件命令、浏览器网址（窗口里的发送页显示的是同样三样）。"""
+    url = code if code.startswith(("http://", "https://")) else "http://" + code
+    print(f"文件码:  {code}")
+    print(f"取件命令: {cmd_prefix()} get {code}")
+    print("          （加 -o <目录> 指定保存位置，默认保存到运行命令时所在目录）")
+    print(f"浏览器:  {url}   （手机 / 没装 LAN Drop 的设备直接打开即可下载）")
+    if qr:
+        from .qr import encode, to_terminal
+        print()
+        print(to_terminal(encode(url)))
+        print("          手机扫码下载")
+
+
 def cmd_send_via_server(args) -> int:
-    paths = expand_paths(args.files) if args.files else expand_paths(pick_interactively())
-    total_bytes = sum(os.path.getsize(p) for p in paths)
-    print(f"上传 {len(paths)} 个文件（{human(total_bytes)}）到 {normalize_base(args.server)} …",
+    paths = expand_paths(args.files or pick_interactively())
+    entries = collect_entries(paths)
+    total_bytes = sum(os.path.getsize(full) for full, _ in entries)
+    print(f"上传 {len(entries)} 个文件（{human(total_bytes)}）到 {normalize_base(args.server)} …",
           file=sys.stderr)
 
     last = {"name": None}
@@ -105,9 +118,7 @@ def cmd_send_via_server(args) -> int:
         return 130
     progress_end()
     print()
-    print(f"文件码:  {res['code']}")
-    print(f"取件命令: {res['command']}")
-    print("          （加 -o <目录> 指定保存位置，默认保存到运行命令时所在目录）")
+    print_code(res["code"], args.qr)
     exp = f"{args.expire:g} 小时后过期" if args.expire else "永不过期"
     times = f"可取 {args.max_downloads} 次" if args.max_downloads else "取件次数不限"
     print(f"共 {res['count']} 个文件，{human(res['bytes'])}，{exp}，{times}；"
@@ -119,7 +130,7 @@ def cmd_send(args) -> int:
     """默认直连：本机临时监听，等对方 get；加 --server 才走常驻服务。"""
     if args.server:
         return cmd_send_via_server(args)
-    paths = expand_paths(args.files or pick_interactively(), allow_dirs=True)
+    paths = expand_paths(args.files or pick_interactively())
     note = lambda m: print(f"  · {m}", file=sys.stderr)  # noqa: E731
     sender = DirectSender(paths, port=args.port, receivers=args.receivers, on_event=note)
     print(f"准备 {len(sender.entries)} 个文件（{human(sender.total_bytes)}），"
@@ -131,9 +142,7 @@ def cmd_send(args) -> int:
     ips = [args.ip] if args.ip else lan_addresses()
     code = make_code(f"http://{ips[0]}:{sender.port}", sender.token)
     print()
-    print(f"文件码:  {code}")
-    print(f"取件命令: {cmd_prefix()} get {code}")
-    print("          （加 -o <目录> 指定保存位置，默认保存到运行命令时所在目录）")
+    print_code(code, args.qr)
     if len(ips) > 1 and not args.ip:
         print("          其他可用地址（若上面的对方连不上，换一个 IP 再试）：" +
               "  ".join(f"{ip}:{sender.port}" for ip in ips[1:]))
@@ -181,9 +190,7 @@ def cmd_get(args) -> int:
 
 
 def cmd_revoke(args) -> int:
-    cli = Client(args.server)
-    cli.login(find_admin_key(args))
-    cli.request("POST", "/api/grants/revoke", {"id": args.grant_id})
+    revoke(args.server, find_admin_key(args), args.grant_id)
     print(f"已撤销 {args.grant_id}，文件码立即失效")
     return 0
 
@@ -205,7 +212,7 @@ def cmd_gui(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="landrop", description="LAN Drop：局域网文件互传与收集")
     p.add_argument("--version", action="version", version=f"landrop {__version__}")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd", metavar="命令")
 
     s = sub.add_parser("send", help="直连发送：生成文件码并等待对方 get（无需服务）；--server 则上传到常驻服务")
     s.add_argument("files", nargs="*", help="文件或目录（可用通配符）；省略则交互选择")
@@ -223,6 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-downloads", type=int, default=1, metavar="N",
                    help="--server 模式：最多被完整取件几次，0 表示不限（默认 1，即一次性）")
     s.add_argument("--label", help="这批文件的备注（默认用文件名）")
+    s.add_argument("--qr", action="store_true", help="在终端里显示二维码（手机扫码用浏览器下载）")
     s.set_defaults(fn=cmd_send)
 
     g = sub.add_parser("get", help="用文件码把文件下载到当前目录（或 -o 指定目录）")
@@ -236,8 +244,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("serve", help="在本机启动收集服务（网页 + CLI；参数见 landrop serve --help）",
                    add_help=False)
 
-    gui = sub.add_parser("gui", help="打开桌面窗口（Windows / macOS）")
-    gui.add_argument("--autostart", action="store_true", help="打开后立即启动服务")
+    gui = sub.add_parser("gui", help="打开桌面窗口")
+    gui.add_argument("--autostart", action="store_true", help="打开后立即启动收集服务")
     gui.set_defaults(fn=cmd_gui)
 
     r = sub.add_parser("revoke", help="撤销一个文件码（需要管理员密钥）")
@@ -249,6 +257,18 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _pause_if_double_clicked():
+    """Windows 上在资源管理器里双击 landrop.exe：控制台窗口一闪而过。只有本进程用这个控制台时停一下。"""
+    if not sys.platform.startswith("win") or not sys.stdin or not sys.stdin.isatty():
+        return
+    try:
+        import ctypes
+        if ctypes.windll.kernel32.GetConsoleProcessList((ctypes.c_uint * 2)(), 2) <= 1:
+            input("这是命令行工具，请在终端里使用；想要图形界面请打开 LAN Drop。按回车键关闭…")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main(argv=None) -> int:
     setup_console()
     argv = sys.argv[1:] if argv is None else list(argv)
@@ -258,7 +278,13 @@ def main(argv=None) -> int:
         except CliError as exc:
             print(f"错误：{exc}", file=sys.stderr)
             return 1
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "fn", None):        # 不带命令：给出用法，而不是一行报错
+        parser.print_help()
+        print(f"\n例：{cmd_prefix()} send a.zip    {cmd_prefix()} get <文件码>    {cmd_prefix()} gui")
+        _pause_if_double_clicked()
+        return 0
     try:
         return args.fn(args)
     except CliError as exc:

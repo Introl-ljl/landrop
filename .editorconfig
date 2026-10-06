@@ -13,3 +13,6 @@ indent_size = 4
 [*.{yml,yaml,html,json}]
 indent_style = space
 indent_size = 2
+
+[*.{iss,isl}]
+charset = utf-8-bom

@@ -1,0 +1,146 @@
+name: Build packages
+
+# 每个平台构建「安装版 + 免安装版」，并在 runner 上真实安装、运行、卸载验证。
+# 被 ci.yml（每次 PR / main）与 release.yml（打 tag）复用；产物以 artifact 形式上传。
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux 用 22.04 构建：glibc 2.35，较老的发行版也能运行
+          - { os: ubuntu-22.04,     target: linux-x86_64 }
+          - { os: ubuntu-22.04-arm, target: linux-arm64 }
+          - { os: windows-latest,   target: windows-x86_64 }
+          - { os: macos-latest,     target: macos-arm64 }
+          - { os: macos-15-intel,   target: macos-x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pyinstaller
+
+      - name: Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # 最新版 Inno Setup（7.0.2+ 自带简体中文界面）；失败时退回 runner 自带的版本
+          choco upgrade innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { Write-Warning "choco upgrade innosetup failed; using preinstalled" }
+          $global:LASTEXITCODE = 0
+
+      # 源码级窗口测试（含 Windows 拖放）：发布流程也自带验证，不依赖 ci.yml
+      - name: GUI end-to-end (source)
+        if: runner.os != 'Linux'
+        run: python -u tests/gui_check.py
+      - name: GUI end-to-end (source, Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+          xvfb-run -a python -u tests/gui_check.py
+
+      - name: GUI screenshots (for review; Pillow is only used here)
+        continue-on-error: true
+        shell: bash
+        run: |
+          python -m pip install pillow
+          if [ "$RUNNER_OS" = "Linux" ]; then xvfb-run -a -s "-screen 0 1280x900x24" python tests/gui_screenshots.py shots
+          else python tests/gui_screenshots.py shots; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: screenshots-${{ matrix.target }}
+          path: shots/*.png
+          if-no-files-found: ignore
+
+      - name: Build app bundle (GUI + CLI)
+        run: pyinstaller --clean --noconfirm landrop.spec
+
+      - name: Make setup + portable packages
+        run: python packaging/package.py --out out
+
+      - name: Single-file zipapp
+        if: matrix.target == 'linux-x86_64'
+        run: python packaging/build_pyz.py out/landrop.pyz
+
+      # ------------------------------------------------------------ 安装后验证
+      - name: Verify (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          sudo apt-get install -y ./out/*-setup.deb
+          test -f /usr/share/applications/landrop.desktop
+          test -L /usr/bin/landrop && test -L /usr/bin/landrop-gui
+          xvfb-run -a python -u tests/package_check.py --cli landrop --gui landrop-gui
+          sudo apt-get remove -y landrop
+          test ! -e /usr/bin/landrop
+          # AppImage：runner 不一定有 FUSE，用解压运行模式；不带参数是窗口，带参数是命令行
+          A="$(ls "$PWD"/out/*-portable.AppImage)"
+          chmod +x "$A"
+          APPIMAGE_EXTRACT_AND_RUN=1 xvfb-run -a python -u tests/package_check.py --cli "$A" --gui "$A"
+          python -m landrop --version
+          if [ -f out/landrop.pyz ]; then python out/landrop.pyz --version; fi
+
+      - name: Verify (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Get-ChildItem out\*-setup.exe | Select-Object -First 1).FullName
+          Start-Process -Wait -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/TASKS=addtopath',"/LOG=$env:RUNNER_TEMP\install.log"
+          $dir = "$env:LOCALAPPDATA\Programs\LAN Drop"
+          if (-not (Test-Path "$dir\landrop.exe")) { Get-Content "$env:RUNNER_TEMP\install.log"; throw "landrop.exe not installed" }
+          if (-not (Test-Path "$dir\LAN Drop.exe")) { throw "LAN Drop.exe not installed" }
+          $userPath = (Get-ItemProperty HKCU:\Environment).Path
+          if ($userPath -notlike "*$dir*") { throw "install dir not added to user PATH: $userPath" }
+          python -u tests/package_check.py --cli "$dir\landrop.exe" --gui "$dir\LAN Drop.exe"
+          if ($LASTEXITCODE -ne 0) { throw "package_check failed (installed)" }
+
+          Start-Process -Wait -FilePath "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          for ($i = 0; $i -lt 60 -and (Test-Path "$dir\landrop.exe"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$dir\landrop.exe") { throw "uninstall left files behind" }
+          $userPath = (Get-ItemProperty HKCU:\Environment).Path
+          if ($userPath -like "*$dir*") { throw "uninstall did not clean PATH: $userPath" }
+
+          $single = (Get-ChildItem out\*-portable.exe | Select-Object -First 1).FullName
+          python -u tests/package_check.py --gui "$single"
+          if ($LASTEXITCODE -ne 0) { throw "package_check failed (single-file portable)" }
+
+          $zip = (Get-ChildItem out\*-portable.zip | Select-Object -First 1).FullName
+          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP\portable"
+          $p = "$env:RUNNER_TEMP\portable\LANDrop"
+          python -u tests/package_check.py --cli "$p\landrop.exe" --gui "$p\LAN Drop.exe" --expect-data-dir "$p\data"
+          if ($LASTEXITCODE -ne 0) { throw "package_check failed (portable)" }
+
+      - name: Verify (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -eux
+          sudo installer -pkg out/*-setup.pkg -target /
+          test -d "/Applications/LAN Drop.app"
+          test -L /usr/local/bin/landrop
+          python -u tests/package_check.py --cli /usr/local/bin/landrop \
+            --gui "/Applications/LAN Drop.app/Contents/MacOS/LAN Drop"
+          M="$RUNNER_TEMP/dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$M" out/*-portable.dmg
+          test -L "$M/Applications"
+          python -u tests/package_check.py --cli "$M/LAN Drop.app/Contents/MacOS/landrop" \
+            --gui "$M/LAN Drop.app/Contents/MacOS/LAN Drop"
+          hdiutil detach "$M"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: landrop-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
