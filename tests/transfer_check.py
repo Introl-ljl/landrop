@@ -37,6 +37,17 @@ class FailingWriter:
 
 
 class FaultHandler(app.Handler):
+    def setup(self):
+        self.store = app.STORE
+        super().setup()
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            # SQLite connections must be closed on their owning request threads.
+            self.store.close()
+
     def do_PUT(self):
         self.server.puts += 1
         super().do_PUT()
@@ -83,7 +94,7 @@ class Transfers(unittest.TestCase):
         for p in self.patches:
             p.start()
         self.server = app._Server(('127.0.0.1', 0), FaultHandler)
-        self.server.daemon_threads = True
+        self.server.daemon_threads = False
         self.server.fault, self.server.puts = '', 0
         self.server.downloads = []
         self.thread = threading.Thread(target=self.server.serve_forever)
