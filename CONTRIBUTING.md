@@ -20,6 +20,7 @@ Thanks for helping! / 欢迎提 issue 和 PR。
 python3 -m landrop serve --data-dir ./data   # run the server
 python3 tests/smoke.py                       # server: permissions, checksums, resume, transfers, migration
 python3 tests/cli_check.py                   # CLI: direct send/get, via-server send, revoke
+python3 tests/transfer_check.py              # transfer coverage and real HTTP fault recovery
 xvfb-run -a python3 tests/gui_check.py       # GUI (Linux needs xvfb; macOS/Windows run it directly)
 python3 -m landrop gui                       # desktop window (needs tkinter)
 

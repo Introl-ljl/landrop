@@ -15,7 +15,7 @@ import time
 import urllib.parse
 import zipfile
 
-from .common import CliError, collect_entries, human, sha256_file
+from .common import CliError, collect_entries, human, merge_ranges, sha256_file
 
 
 def _hostname_ips(timeout: float) -> list[str]:
@@ -73,7 +73,7 @@ class DirectSender:
         self.receivers = max(1, receivers)
         self.max_failures = max_failures
         self.on_event = on_event or (lambda msg: None)
-        self.entries = self._collect(paths)
+        self.entries, self.warnings = self._collect(paths)
         if not self.entries:
             raise CliError("没有可发送的文件")
         self.finished = threading.Event()
@@ -81,9 +81,12 @@ class DirectSender:
         self._lock = threading.Lock()
         self._sessions: set[str] = set()
         self._complete: dict[str, set[str]] = {}   # 会话 → 已完整送达的文件 id
+        self._ranges: dict = {}
         self._counted: set[str] = set()            # 已算作「取完」的会话
         self._failures = 0
         self._done = 0
+        self._ready = threading.Event()         # 校验值就绪前，登录/下载返回 503 让接收端等待
+        self.hash_error = ""
         self._hash_cache: dict[int, str] = {}
         self.httpd = _QuietServer((host, port), self._make_handler())
         self.port = self.httpd.server_address[1]
@@ -91,14 +94,28 @@ class DirectSender:
     # ---- 文件清单
     @staticmethod
     def _collect(paths):
-        return [{"id": str(i), "path": full, "name": rel, "size": os.path.getsize(full)}
-                for i, (full, rel) in enumerate(collect_entries(paths))]
+        warnings = []
+        entries = collect_entries(paths, warnings.append)
+        return ([{"id": str(i), "path": full, "name": rel, "size": os.path.getsize(full)}
+                 for i, (full, rel) in enumerate(entries)], warnings)
 
     def prepare_hashes(self, on_progress=None):
-        for e in self.entries:
-            e["sha256"] = sha256_file(e["path"])
-            if on_progress:
-                on_progress(e["name"])
+        try:
+            for e in self.entries:
+                if self.finished.is_set():
+                    break
+                try:
+                    e["sha256"] = sha256_file(e["path"])
+                except OSError as exc:
+                    self.hash_error = str(exc)
+                if on_progress:
+                    on_progress(e["name"])
+        finally:
+            self._ready.set()
+
+    def start_hashing(self, on_progress=None):
+        """后台计算校验值，不再阻塞监听；就绪前接收端登录会得到 503 并自动等待。"""
+        threading.Thread(target=self.prepare_hashes, args=(on_progress,), daemon=True).start()
 
     @property
     def total_bytes(self) -> int:
@@ -141,7 +158,7 @@ class DirectSender:
     def _count_done(self, sid: str):
         """一个接收者取完：同一会话只算一次（浏览器下载完 + 命令行的 /api/done 不会重复计数）。"""
         with self._lock:
-            if sid in self._counted:
+            if sid in self._counted or len(self._complete.get(sid, set())) < len(self.entries):
                 return
             self._counted.add(sid)
             self._done += 1
@@ -149,6 +166,16 @@ class DirectSender:
         self.on_event("接收完成")
         if complete:
             self.stop("done")
+
+    def _record_range(self, sid, entry, start, stop):
+        if stop <= start and entry["size"]:
+            return
+        with self._lock:
+            key = (sid, entry["id"])
+            ranges = self._ranges[key] = merge_ranges(self._ranges.get(key, []), start, stop)
+            complete = not entry["size"] or ranges == [[0, entry["size"]]]
+        if complete:
+            self._mark_complete(sid, [entry["id"]])
 
     def _fail_attempt(self):
         time.sleep(0.3)
@@ -212,17 +239,26 @@ class DirectSender:
             def _cookie(self, sid):
                 return {"Set-Cookie": f"ld_direct={sid}; Path=/; HttpOnly; SameSite=Lax"}
 
+            def _not_ready(self):
+                return self._json({"ok": False, "error": "发送端正在准备校验值，请稍候"},
+                                  503, headers={"Retry-After": "2"})
+
             def do_POST(self):
                 path = urllib.parse.urlparse(self.path).path
                 if path == "/api/login":
+                    if not sender._ready.is_set():
+                        return self._not_ready()
                     try:
                         key = str(json.loads(self._body() or b"{}").get("key") or "")
                     except ValueError:
                         key = ""
                     if hmac.compare_digest(key.encode(), sender.token.encode()):
-                        sid = sender._new_session(self.client_address[0])
+                        sid = self._sid()
+                        if sid in sender._counted or sid is None:
+                            sid = sender._new_session(self.client_address[0])
                         return self._json({"ok": True, "kind": "direct", "perm": "read",
-                                           "label": "direct"}, headers=self._cookie(sid))
+                                           "label": "direct", "range_progress": True},
+                                          headers=self._cookie(sid))
                     self._json({"ok": False, "error": "密钥错误"}, 401)
                     sender._fail_attempt()
                     return
@@ -231,7 +267,9 @@ class DirectSender:
                     sid = self._sid()
                     if sid is None:
                         return self._json({"ok": False, "error": "未登录"}, 401)
-                    self._json({"ok": True})
+                    with sender._lock:
+                        complete = len(sender._complete.get(sid, set())) == len(sender.entries)
+                    self._json({"ok": True, "complete": complete})
                     sender._count_done(sid)
                     return
                 self._json({"ok": False, "error": "not found"}, 404)
@@ -247,9 +285,13 @@ class DirectSender:
                 sid = self._sid()
                 if sid is None:
                     return self._json({"ok": False, "error": "未登录"}, 401)
+                if not sender._ready.is_set():
+                    return self._not_ready()
                 if path == "/api/files":
+                    with sender._lock:
+                        fetched = set(sender._complete.get(sid, set()))
                     return self._json({"ok": True, "files": [
-                        {"id": e["id"], "name": e["name"], "size": e["size"],
+                        {"id": e["id"], "name": e["name"], "size": e["size"], "received": e["id"] in fetched,
                          "sha256": e.get("sha256", ""), "mtime": 0} for e in sender.entries]})
                 if path == "/api/download":
                     return self._download(parsed, sid)
@@ -261,6 +303,9 @@ class DirectSender:
             def _page(self, path):
                 token = path.strip("/")
                 if token and hmac.compare_digest(token.encode(), sender.token.encode()):
+                    if not sender._ready.is_set():
+                        return self._html(_message_page("正在准备文件", "请稍候刷新此页面。"), 503,
+                                          headers={"Retry-After": "2"})
                     sid = self._sid() or sender._new_session(self.client_address[0])
                     return self._html(_landing_page(sender), headers=self._cookie(sid))
                 if re.fullmatch(r"[A-Za-z0-9_-]{8,64}", token):     # 像令牌却不对：算一次失败
@@ -275,6 +320,10 @@ class DirectSender:
                 entry = next((e for e in sender.entries if e["id"] == fid), None)
                 if entry is None:
                     return self._json({"ok": False, "error": "文件不存在"}, 404)
+                if urllib.parse.parse_qs(parsed.query).get("progress") == ["1"]:
+                    with sender._lock:
+                        ranges = list(sender._ranges.get((sid, fid), []))
+                    return self._json({"ok": True, "ranges": ranges})
                 size = entry["size"]
                 start, end, partial = 0, max(size - 1, 0), False
                 rng = self.headers.get("Range") or ""
@@ -318,11 +367,11 @@ class DirectSender:
                             self.wfile.write(chunk)
                             left -= len(chunk)
                 except (BrokenPipeError, ConnectionResetError):
-                    return
-                if left == 0 and end >= size - 1:
+                    pass
+                finally:
+                    sender._record_range(sid, entry, start, start + length - left)
+                if left == 0:
                     sender.on_event(f"已发送：{entry['name']}  ({human(size)})")
-                    if start == 0:      # 只读文件尾（播放器探测 / 续传）不算整份送达；续传的 get 会调 /api/done
-                        sender._mark_complete(sid, [entry["id"]])
 
             def _zip(self, sid):
                 """全部文件打成一个 zip 边读边发（不落临时文件；存储模式，不压缩）。"""

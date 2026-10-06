@@ -30,6 +30,8 @@ jobs:
         run: python -u tests/smoke.py
       - name: CLI end-to-end tests
         run: python -u tests/cli_check.py
+      - name: Transfer recovery regression tests
+        run: python -u tests/transfer_check.py
       - name: GUI end-to-end tests (Linux, virtual display)
         if: runner.os == 'Linux'
         run: |

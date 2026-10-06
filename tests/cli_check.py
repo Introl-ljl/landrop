@@ -124,6 +124,28 @@ def direct_checks(tmp):
     except common.CliError:
         check(True, "safe_relpath 拒绝 ..")
 
+    # 重名文件不再被静默丢弃：第二个自动带上父目录名
+    dup_dir = os.path.join(src, "dup")
+    os.makedirs(dup_dir)
+    with open(os.path.join(dup_dir, "a.txt"), "w") as f:
+        f.write("D")
+    proc, code = start_direct_sender([os.path.join(src, "proj", "a.txt"),
+                                      os.path.join(dup_dir, "a.txt")])
+    check(bool(code), "重名发送输出文件码")
+    dest2 = os.path.join(tmp, "dup-out")
+    os.makedirs(dest2, exist_ok=True)
+    rc, _, _ = run(["get", code, "-o", dest2])
+    check(rc == 0, "重名发送 get 成功")
+    check(os.path.isfile(os.path.join(dest2, "a.txt")) and
+          open(os.path.join(dest2, "a.txt")).read() == "A", "第一个同名文件原样保存")
+    check(os.path.isfile(os.path.join(dest2, "dup", "a.txt")) and
+          open(os.path.join(dest2, "dup", "a.txt")).read() == "D", "第二个同名文件带父目录名")
+    try:
+        check(proc.wait(timeout=15) == 0, "重名接收完成后发送端退出(0)")
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        check(False, "重名接收完成后发送端退出(0)")
+
 
 def browser_checks(tmp):
     """文件码当网址用：没装 LAN Drop 的设备用浏览器打开就能下载；下完全部文件发送端自动结束。"""

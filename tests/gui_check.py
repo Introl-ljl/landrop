@@ -116,9 +116,19 @@ def main():
     check(os.path.isfile(got) and open(got, "rb").read() == payload, "大文件内容一致")
     check(open(os.path.join(out, "folder", "sub", "b.txt")).read() == "B", "文件夹结构保留")
     check(not os.path.exists(os.path.join(out, "other.txt")), "未勾选的文件没有下载")
+    check(send.busy and send.sender is not None and not send.sender.finished.is_set(),
+          "部分取件后发送端继续等待，不消耗完整接收名额")
+    check(len(recv.history) == 1, "部分取件记入最近接收")
+    recv.preview()
+    check(pump(lambda: recv.listing is not None), "再次预览剩余文件")
+    for f in recv.listing:
+        recv.picks[f["id"]].set(f["name"] == "other.txt")
+    recv.receive()
+    check(pump(lambda: recv.task_pill.text == "完成"), "补取剩余文件成功")
+    check(os.path.isfile(os.path.join(out, "other.txt")), "剩余文件已保存")
     check(pump(lambda: send.state_pill.text == "已送达"), "发送端自动结束：" + send.status.get())
     check(not send.busy and send.sender is None, "结束后状态复位")
-    check(len(recv.history) == 1, "记入「最近接收」")
+    check(len(recv.history) == 2, "两次接收都记入最近接收")
 
     print("\n[取消]")
     send.reset()

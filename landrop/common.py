@@ -137,9 +137,9 @@ def extract_code(text: str) -> str:
     return m.group(0) if m else (text or "").strip()
 
 
-def collect_entries(paths: list[str]) -> list[tuple[str, str]]:
+def collect_entries(paths: list[str], on_warning=None) -> list[tuple[str, str]]:
     """把要发送的文件/文件夹展开成 [(本地路径, 相对名)]。直连与经服务器共用，行为一致：
-    文件用文件名，文件夹保留「文件夹名/子路径」结构；重名只取第一个。"""
+    文件用文件名，文件夹保留「文件夹名/子路径」结构；重名自动区分。"""
     entries, seen, out = [], set(), []
     for p in paths:
         p = os.path.abspath(p)
@@ -154,10 +154,33 @@ def collect_entries(paths: list[str]) -> list[tuple[str, str]]:
         elif os.path.isfile(p):
             entries.append((p, os.path.basename(p)))
     for full, rel in entries:
-        if rel not in seen:
-            seen.add(rel)
-            out.append((full, rel))
+        if rel in seen:
+            original = rel
+            parent = os.path.basename(os.path.dirname(full))
+            alt = f"{parent}/{rel}" if parent else rel
+            if alt in seen:
+                stem, ext = os.path.splitext(rel)
+                i = 1
+                while f"{stem} ({i}){ext}" in seen:
+                    i += 1
+                alt = f"{stem} ({i}){ext}"
+            rel = alt
+            if on_warning:
+                on_warning(f"重名：{original} → 以 {rel} 发送")
+        seen.add(rel)
+        out.append((full, rel))
     return out
+
+
+def merge_ranges(ranges, start: int, stop: int) -> list[list[int]]:
+    """Merge overlapping half-open byte intervals, including adjacent intervals."""
+    merged = []
+    for lo, hi in sorted(list(ranges) + ([[start, stop]] if stop > start else [])):
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return merged
 
 
 def unique_path(directory: str, name: str) -> str:

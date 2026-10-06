@@ -69,9 +69,6 @@ _attempts: dict = {}
 _attempts_lock = threading.Lock()
 _upload_locks: dict = {}
 _upload_locks_lock = threading.Lock()
-_pickups: dict = {}                 # 会话 → 已完整下载的文件 id（一次性传输计数用）
-_pickups_counted: set = set()       # 已记过一次取件的会话
-_pickups_lock = threading.Lock()
 TOKEN_PATH = re.compile(r"/([A-Za-z0-9_-]{16,64})/?")
 
 
@@ -253,6 +250,10 @@ class Handler(BaseHTTPRequestHandler):
             arr = [t for t in _attempts.get(ip, []) if ts - t < ATTEMPT_WINDOW]
             arr.append(ts)
             _attempts[ip] = arr
+            if len(_attempts) > 4096:       # 顺带回收不再活跃的 IP，避免表无限增长
+                for k in [k for k, v in _attempts.items()
+                          if not v or ts - v[-1] >= ATTEMPT_WINDOW]:
+                    _attempts.pop(k, None)
 
     def _clear_attempts(self):
         with _attempts_lock:
@@ -352,8 +353,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/" and method in ("GET", "HEAD"):
                 return self.serve_static("index.html")
             if method in ("GET", "HEAD"):
-                rel = path.lstrip("/")
-                if rel and ".." not in rel.split("/"):
+                rel = path.lstrip("/").replace("\\", "/")
+                if rel and ".." not in rel.split("/") and all(ord(c) >= 32 for c in rel):
                     if (TOKEN_PATH.fullmatch(path)
                             and not os.path.isfile(os.path.join(resource_dir(), rel))):
                         # 文件码 = 地址/令牌：浏览器直接打开也能取件（网页从路径读出令牌并自动登录）
@@ -374,7 +375,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ 静态
     def serve_static(self, rel: str, private: bool = False):
-        full = os.path.join(resource_dir(), rel)
+        base = os.path.realpath(resource_dir())
+        full = os.path.realpath(os.path.join(base, rel))
+        if full != base and not full.startswith(base + os.sep):
+            return self._err(HTTPStatus.NOT_FOUND, "not found")
         if not os.path.isfile(full):
             self._err(HTTPStatus.NOT_FOUND, "not found")
             return
@@ -433,6 +437,7 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "kind": grant["kind"],
+                "range_progress": True,
                 "perm": grant["perm"],
                 "label": grant["label"],
                 "capabilities": CAPS["admin"] if grant["kind"] == "admin" else CAPS[grant["perm"]],
@@ -512,6 +517,8 @@ class Handler(BaseHTTPRequestHandler):
         rows = STORE.list_files(space_id)
         space = STORE.get_space(space_id)
         my_visitor = auth["visitor"]["id"]
+        fetched = (STORE.fetched_files(auth["grant"]["id"], my_visitor)
+                   if self._transfer_grant(auth) is not None else set())
         delete_scope = caps.get("delete")
         self._send_json({
             "ok": True,
@@ -522,6 +529,7 @@ class Handler(BaseHTTPRequestHandler):
             "files": [
                 {
                     "id": r["id"],
+                    "received": r["id"] in fetched,
                     "name": r["display_name"],
                     "stored_name": r["stored_name"],
                     "size": r["size"],
@@ -598,6 +606,17 @@ class Handler(BaseHTTPRequestHandler):
 
         lock = get_upload_lock(safe_id)
         with lock:
+            completed = STORE.get_upload_receipt(safe_id)
+            if completed is not None:
+                self._drain_body()
+                if (completed["visitor_id"] != visitor or completed["grant_id"] != grant_id
+                        or completed["space_id"] != space_id):
+                    return self._err(HTTPStatus.FORBIDDEN, "该上传会话不属于当前身份")
+                receipt = json.loads(completed["receipt"])
+                if (receipt["name"] != name or (total is not None and receipt["size"] != total)
+                        or (expect and receipt["sha256"] != expect)):
+                    return self._err(HTTPStatus.CONFLICT, "上传 id 已用于其他文件")
+                return self._send_json(receipt)
             row = STORE.get_upload(safe_id)
             if row is None:
                 if offset != 0:
@@ -698,10 +717,7 @@ class Handler(BaseHTTPRequestHandler):
             owner_visitor=row["visitor_id"],
             owner_grant=row["grant_id"],
         )
-        STORE.drop_upload(upload_id)
-        drop_upload_lock(upload_id)
-        log(f"上传完成  <- {self._client_ip()}  {stored}  ({human_size(size)})  sha256={actual[:12]}…")
-        self._send_json({
+        receipt = {
             "ok": True,
             "complete": True,
             "id": fid,
@@ -710,7 +726,12 @@ class Handler(BaseHTTPRequestHandler):
             "size": size,
             "sha256": actual,
             "verified": bool(expect),
-        })
+        }
+        STORE.save_upload_receipt(row, receipt)
+        STORE.drop_upload(upload_id)
+        drop_upload_lock(upload_id)
+        log(f"上传完成  <- {self._client_ip()}  {stored}  ({human_size(size)})  sha256={actual[:12]}…")
+        self._send_json(receipt)
 
     def _cleanup_upload(self, upload_id):
         try:
@@ -776,6 +797,11 @@ class Handler(BaseHTTPRequestHandler):
         if row is None:
             return self._err(HTTPStatus.NOT_FOUND if "不存在" in why else HTTPStatus.FORBIDDEN, why)
 
+        if qs.get("progress") == ["1"]:
+            ranges = (STORE.get_fetch_ranges(auth["grant"]["id"], auth["visitor"]["id"], row["id"])
+                      if self._transfer_grant(auth) is not None else [[0, row["size"]]])
+            return self._send_json({"ok": True, "ranges": ranges})
+
         full = STORE.file_path(row)
         if not os.path.isfile(full):
             return self._err(HTTPStatus.NOT_FOUND, "文件已不在磁盘上")
@@ -831,19 +857,22 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "HEAD":
             return
         left = length
-        if size:
-            with open(full, "rb") as f:
-                f.seek(start)
-                while left > 0:
-                    chunk = f.read(min(CHUNK_SIZE, left))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    left -= len(chunk)
-        # 从第 0 字节一直送到最后一个字节才算「取完」：播放器探测文件尾（Range: bytes=N-）不算。
-        # 命令行跨会话断点续传只会下尾部，但它最后会调 /api/done，照样计数。
-        if left == 0 and start == 0 and end >= size - 1:
-            self._note_complete(auth, row)
+        try:
+            if size:
+                with open(full, "rb") as f:
+                    f.seek(start)
+                    while left > 0:
+                        chunk = f.read(min(CHUNK_SIZE, left))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        left -= len(chunk)
+        finally:
+            # Successful writes still count when a later write loses the connection.
+            if self._transfer_grant(auth) is not None:
+                if STORE.record_fetch_range(auth["grant"]["id"], auth["visitor"]["id"], row["id"],
+                                            start, start + length - left):
+                    log(f"传输取件次数已用完  <- {self._client_ip()}  {auth['grant']['id']}")
 
     @staticmethod
     def _inline_ok(ctype: str) -> bool:
@@ -1087,50 +1116,13 @@ class Handler(BaseHTTPRequestHandler):
         space = STORE.get_space(g["space_id"]) if g["space_id"] else None
         return g if space is not None and space["transient"] else None
 
-    def _count_pickup(self, auth) -> bool:
-        """给传输类授权记一次「完整取件」；同一会话只记一次。返回是否已用完次数。"""
-        g = self._transfer_grant(auth)
-        if g is None:
-            return False
-        sid = auth["session"]["token_hash"]
-        with _pickups_lock:
-            if sid in _pickups_counted:
-                return False
-            _pickups_counted.add(sid)
-            _pickups.pop(sid, None)
-        exhausted = STORE.record_download(g["id"])
-        if exhausted:
-            log(f"传输已取完  <- {self._client_ip()}  {g['id']}")
-        return exhausted
-
-    def _note_complete(self, auth, row):
-        """浏览器取件不会调用 /api/done：同一会话把传输里的文件都完整下载过一遍，也算一次取件。"""
-        if self._transfer_grant(auth) is None:
-            return
-        sid = auth["session"]["token_hash"]
-        wanted = {r["id"] for r in STORE.list_files(row["space_id"])}
-        with _pickups_lock:
-            got = _pickups.setdefault(sid, set())
-            got.add(row["id"])
-            complete = wanted <= got
-        if complete:
-            self._count_pickup(auth)
-
     def api_done(self):
-        """接收端取完全部文件后调用：传输类授权据此累计次数，用完即失效并清理。
-        与「整份下载完自动计数」共用同一会话标记，不会重复计数。
-        对普通分享链接与直连发送端的协议保持一致，是无害的空操作。"""
+        """Compatibility signal only; pickup quotas are enforced from served byte ranges."""
         auth = self._auth()
         self._drain_body()
         if auth is None:
             return self._err(HTTPStatus.UNAUTHORIZED, "未登录")
-        exhausted = self._count_pickup(auth)
-        g = self._transfer_grant(auth)
-        if g is not None and not exhausted:
-            row = STORE.get_grant(g["id"])
-            exhausted = bool(row and row["max_downloads"] is not None
-                             and row["downloads"] >= row["max_downloads"])
-        self._send_json({"ok": True, "exhausted": exhausted})
+        self._send_json({"ok": True})
 
     def api_spaces_list(self):
         auth = self._require_admin()
@@ -1206,7 +1198,10 @@ def parse_args(argv=None):
                    help="对外访问地址（默认自动探测）；容器内请设为宿主机局域网地址，"
                         "如 http://192.168.1.10:8800，否则分享链接会指向容器内网地址")
     p.add_argument("--no-banner", action="store_true", help="不打印启动横幅（GUI 用）")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.reset_admin and not (args.admin_key or os.environ.get("LANDROP_ADMIN_KEY")):
+        p.error("--reset-admin 需要同时提供 --admin-key（或环境变量 LANDROP_ADMIN_KEY）")
+    return args
 
 
 _janitor_started = False
@@ -1226,9 +1221,10 @@ def _start_janitor(interval: float = 60.0):
             try:
                 if STORE is not None:
                     STORE.purge_expired()
+                    parts = STORE.purge_orphan_parts()
                     n = STORE.cleanup_transfers()
-                    if n:
-                        log(f"已清理 {n} 个失效传输")
+                    if n or parts:
+                        log(f"已清理 {n} 个失效传输、{parts} 个孤儿分块")
             except Exception as exc:  # noqa: BLE001
                 log(f"!! 清理任务出错: {exc!r}")
     threading.Thread(target=loop, daemon=True, name="janitor").start()

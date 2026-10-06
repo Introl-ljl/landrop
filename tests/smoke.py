@@ -452,15 +452,35 @@ def run_checks(port, data_dir):
     check("传输文件内容与摘要头正确", got == data and hdrs.get("X-File-SHA256") == hashlib.sha256(data).hexdigest())
     rx.request("PUT", "/api/upload?name=evil&id=evil&offset=0&total=1", b"x", expect=403)
     check("传输令牌不能删文件", rx.request("DELETE", f"/api/delete?id={files[0]['id']}")[0] == 403)
-    st, body, _ = rx.request("POST", "/api/done", {}, expect=200)
-    check("第 1 次取件后仍可用", json.loads(body)["exhausted"] is False)
+    check("第 1 次完整取件后仍可用", rx.request("GET", "/api/files")[0] == 200)
+    rx.request("POST", "/api/done", {}, expect=200)
+    check("done 上报不再重复计数（服务端按字节统计）", rx.request("GET", "/api/files")[0] == 200)
     rx2 = Client(port)
     rx2.request("POST", "/api/login", {"key": tr["secret"]}, expect=200)
-    st, body, _ = rx2.request("POST", "/api/done", {}, expect=200)
-    check("第 2 次取件后次数用完", json.loads(body)["exhausted"] is True)
-    Client(port).request("POST", "/api/login", {"key": tr["secret"]}, expect=401)
+    rx2.request("GET", f"/api/download?id={files[0]['id']}", expect=200)
+    check("第 2 次取件后次数用完（无需接收端上报）",
+          Client(port).request("POST", "/api/login", {"key": tr["secret"]})[0] == 401)
     rx.request("GET", "/api/files", expect=401)
     check("用完后已有会话也立即失效", True)
+
+    # 多文件传输：只取部分（--only 场景）不消耗次数；不报 done 的浏览器取件同样被统计
+    st, body, _ = admin.request("POST", "/api/transfers",
+                                {"label": "部分取件", "expires_hours": 1, "max_downloads": 1},
+                                expect=201)
+    tp = json.loads(body)["transfer"]
+    for i in (1, 2):
+        chunk = f"part{i}".encode()
+        admin.request("PUT", f"/api/upload?name=p{i}.bin&id=pp{i}&offset=0&total={len(chunk)}"
+                      f"&space={tp['space_id']}", chunk, expect=200)
+    rp = Client(port)
+    rp.request("POST", "/api/login", {"key": tp["secret"]}, expect=200)
+    pfiles = json.loads(rp.request("GET", "/api/files", expect=200)[1])["files"]
+    rp.request("GET", f"/api/download?id={pfiles[0]['id']}", expect=200)
+    rp.request("POST", "/api/done", {}, expect=200)
+    check("只取部分文件不消耗次数", rp.request("GET", "/api/files")[0] == 200)
+    rp.request("GET", f"/api/download?id={pfiles[1]['id']}", expect=200)
+    check("取齐全部文件后失效（浏览器路径同样被统计）",
+          Client(port).request("POST", "/api/login", {"key": tp["secret"]})[0] == 401)
 
     st, body, _ = make_transfer(label="过期", expires_hours=0.0003, max_downloads=0), None, None
     short = st[0]
@@ -474,16 +494,54 @@ def run_checks(port, data_dir):
 
     live, _d = make_transfer(label="保留", expires_hours=1, max_downloads=0)
     janitor = sm.Store(data_dir)
-    dirs = {t["id"]: janitor.space_dir(t["space_id"]) for t in (tr, short, rev, live)}
+    dirs = {t["id"]: janitor.space_dir(t["space_id"]) for t in (tr, short, rev, tp, live)}
     check("清理前磁盘上有文件", all(os.path.isdir(d) for d in dirs.values()))
     removed = janitor.cleanup_transfers()
-    check("清理 3 个失效传输（取完/过期/撤销）", removed == 3, str(removed))
+    check("清理 4 个失效传输（取完×2/过期/撤销）", removed == 4, str(removed))
     check("失效传输的磁盘文件已删除",
-          not any(os.path.exists(dirs[t["id"]]) for t in (tr, short, rev)))
+          not any(os.path.exists(dirs[t["id"]]) for t in (tr, short, rev, tp)))
     check("仍有效的传输不受影响", os.path.isdir(dirs[live["id"]]) and
           [x["id"] for x in janitor.list_transfers()] == [live["id"]])
     Client(port).request("POST", "/api/login", {"key": live["secret"]}, expect=200)
     janitor.close()
+
+    print("\n[15] 孤儿分块清理")
+    store15 = sm.Store(data_dir)
+    store15.create_upload("keptpart", default_space, "v1", "g1", "kept.bin", 4)
+    kept = os.path.join(data_dir, "partial", "keptpart.part")
+    stray = os.path.join(data_dir, "partial", "orphan99.part")
+    with open(kept, "wb") as fh:
+        fh.write(b"keep")
+    with open(stray, "wb") as fh:
+        fh.write(b"junk")
+    old_mtime = time.time() - 3600
+    os.utime(kept, (old_mtime, old_mtime))
+    os.utime(stray, (old_mtime, old_mtime))
+    removed_parts = store15.purge_orphan_parts()
+    check("无主分块被清理", removed_parts >= 1 and not os.path.exists(stray), str(removed_parts))
+    check("在传会话的分块保留", os.path.exists(kept))
+    store15.drop_upload("keptpart")
+    os.remove(kept)
+    store15.close()
+
+    print("\n[16] 静态资源路径穿越防护（Windows 反斜杠/盘符形态）")
+    def raw_get(target):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", target)
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        return r.status, body
+
+    probes = ["/..\\..\\..\\pyproject.toml", "/../../state.sqlite3",
+              "/..%2f..%2fstate.sqlite3", "/..%5C..%5Cpyproject.toml",
+              "/C:/pyproject.toml", "/....//....//pyproject.toml"]
+    for probe in probes:
+        st16, body16 = raw_get(probe)
+        check(f"穿越探测被拒：{probe}",
+              st16 in (400, 404) and b"build-system" not in body16
+              and b"SQLite format" not in body16, f"got {st16}")
+    check("正常页面仍可访问", raw_get("/")[0] == 200)
 
     # 旧版数据库（没有新增列）必须能原样打开并迁移
     import sqlite3
@@ -542,6 +600,13 @@ def run_checks(port, data_dir):
     ids = [f["id"] for f in json.loads(body)["files"]]
     web.request("GET", f"/api/download?id={ids[0]}", headers={"Range": "bytes=0-3"}, expect=206)
     web.request("GET", f"/api/download?id={ids[0]}", headers={"Range": "bytes=0-3"}, expect=206)
+    st, progress_body, _ = web.request("GET", f"/api/download?id={ids[0]}&progress=1", expect=200)
+    check("重复区间合并，不重复累计", json.loads(progress_body)["ranges"] == [[0, 4]])
+    Client(port).request("GET", f"/api/download?id={ids[0]}&progress=1", expect=401)
+    other_web = Client(port)
+    other_web.request("POST", "/api/login", {"key": tr["secret"]}, expect=200)
+    st, progress_body, _ = other_web.request("GET", f"/api/download?id={ids[0]}&progress=1", expect=200)
+    check("其他接收者看不到本人的取件进度", json.loads(progress_body)["ranges"] == [])
     Client(port).request("POST", "/api/login", {"key": tr["secret"]}, expect=200)
     check("只下了一部分：不计数", True)
     web.request("GET", f"/api/download?id={ids[1]}", headers={"Range": "bytes=3-"}, expect=206)

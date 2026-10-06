@@ -26,6 +26,8 @@ import threading
 import time
 import unicodedata
 
+from landrop.common import merge_ranges
+
 PBKDF2_ROUNDS = 120_000            # 人类口令的派生轮数
 SESSION_TTL = 7 * 86400            # 会话有效期（秒）
 VISITOR_TTL = 400 * 86400          # 访客 Cookie 有效期（秒）
@@ -104,6 +106,22 @@ CREATE TABLE IF NOT EXISTS uploads (
   received      INTEGER NOT NULL DEFAULT 0,
   created_at    REAL NOT NULL,
   updated_at    REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fetch_ranges (
+  grant_id   TEXT NOT NULL REFERENCES grants(id) ON DELETE CASCADE,
+  visitor_id TEXT NOT NULL REFERENCES visitors(id) ON DELETE CASCADE,
+  file_id    TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  ranges     TEXT NOT NULL,
+  PRIMARY KEY (grant_id, visitor_id, file_id)
+);
+CREATE TABLE IF NOT EXISTS upload_receipts (
+  id         TEXT PRIMARY KEY,
+  space_id   TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+  visitor_id TEXT NOT NULL,
+  grant_id   TEXT NOT NULL,
+  file_id    TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  receipt    TEXT NOT NULL,
+  created_at REAL NOT NULL
 );
 """
 
@@ -346,6 +364,52 @@ class Store:
             g = self.get_grant(grant_id)
         return bool(g and g["max_downloads"] is not None and g["downloads"] >= g["max_downloads"])
 
+    def record_fetch_range(self, grant_id: str, visitor_id: str, file_id: str,
+                           start: int, stop: int) -> bool:
+        """Count a pickup only when one visitor has covered every file in the batch."""
+        with self._write_lock, self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            file = self.get_file(file_id)
+            if file is None or not self.grant_state(grant_id)[0]:
+                return False
+            start, stop = max(0, start), min(stop, file["size"])
+            if stop <= start and file["size"]:
+                return False
+            previous = self._one(
+                "SELECT ranges FROM fetch_ranges WHERE grant_id=? AND visitor_id=? AND file_id=?",
+                (grant_id, visitor_id, file_id))
+            ranges = merge_ranges(json.loads(previous["ranges"]) if previous else [], start, stop)
+            self._write(
+                "INSERT INTO fetch_ranges(grant_id,visitor_id,file_id,ranges) VALUES(?,?,?,?) "
+                "ON CONFLICT(grant_id,visitor_id,file_id) DO UPDATE SET ranges=excluded.ranges",
+                (grant_id, visitor_id, file_id, json.dumps(ranges)),
+            )
+            files = self._query(
+                "SELECT f.size, fp.ranges FROM files f LEFT JOIN fetch_ranges fp ON "
+                "fp.file_id=f.id AND fp.grant_id=? AND fp.visitor_id=? "
+                "WHERE f.status='active' AND f.space_id=(SELECT space_id FROM grants WHERE id=?)",
+                (grant_id, visitor_id, grant_id))
+            if not files or any(r["ranges"] is None or
+                                json.loads(r["ranges"]) != ([[0, r["size"]]] if r["size"] else [])
+                                for r in files):
+                return False
+            self._write("DELETE FROM fetch_ranges WHERE grant_id=? AND visitor_id=?",
+                        (grant_id, visitor_id))
+            return self.record_download(grant_id)
+
+    def get_fetch_ranges(self, grant_id: str, visitor_id: str, file_id: str):
+        row = self._one("SELECT ranges FROM fetch_ranges WHERE grant_id=? AND visitor_id=? AND file_id=?",
+                        (grant_id, visitor_id, file_id))
+        return json.loads(row["ranges"]) if row else []
+
+    def fetched_files(self, grant_id: str, visitor_id: str):
+        rows = self._query(
+            "SELECT fp.file_id, fp.ranges, f.size FROM fetch_ranges fp "
+            "JOIN files f ON f.id=fp.file_id WHERE fp.grant_id=? AND fp.visitor_id=?",
+            (grant_id, visitor_id))
+        return {r["file_id"] for r in rows
+                if json.loads(r["ranges"]) == ([[0, r["size"]]] if r["size"] else [])}
+
     def list_transfers(self):
         rows = self._query(
             "SELECT g.*, s.id AS sid FROM grants g JOIN spaces s ON s.id=g.space_id "
@@ -530,9 +594,44 @@ class Store:
         ts = now()
         with self._write_lock:
             self._write("DELETE FROM sessions WHERE expires_at<?", (ts,))
-            self._write(
-                "DELETE FROM uploads WHERE updated_at<?", (ts - 3 * 86400,)
-            )
+            stale = self._query("SELECT id FROM uploads WHERE updated_at<?", (ts - 3 * 86400,))
+            for r in stale:                     # 行删掉之前先把对应的分块文件一并清掉
+                try:
+                    os.remove(self.part_path(r["id"]))
+                except OSError:
+                    pass
+            self._write("DELETE FROM uploads WHERE updated_at<?", (ts - 3 * 86400,))
+            if self._one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fetch_progress'"):
+                self._write("DELETE FROM fetch_progress WHERE grant_id NOT IN (SELECT id FROM grants)")
+            self._write("DELETE FROM upload_receipts WHERE created_at<?", (ts - SESSION_TTL,))
+
+    def purge_orphan_parts(self, min_age: float = 600) -> int:
+        """清理 partial/ 下没有对应上传会话的分块文件（进程中断、传输被清理等留下的孤儿）。
+
+        min_age 秒内的新文件不动，避免与正在创建的上传竞态。"""
+        try:
+            names = os.listdir(self.partial_dir)
+        except OSError:
+            return 0
+        cutoff = now() - min_age
+        removed = 0
+        for fn in names:
+            if not fn.endswith(".part"):
+                continue
+            path = os.path.join(self.partial_dir, fn)
+            try:
+                if os.path.getmtime(path) >= cutoff:
+                    continue
+            except OSError:
+                continue
+            if self._one("SELECT 1 FROM uploads WHERE id=?", (fn[:-len(".part")],)):
+                continue
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+        return removed
 
     # ---------------------------------------------------------------- 文件
     def list_files(self, space_id: str, owner_visitor: str | None = None):
@@ -634,6 +733,16 @@ class Store:
 
     def drop_upload(self, upload_id: str):
         self._write("DELETE FROM uploads WHERE id=?", (upload_id,))
+
+    def get_upload_receipt(self, upload_id: str):
+        return self._one("SELECT * FROM upload_receipts WHERE id=?", (upload_id,))
+
+    def save_upload_receipt(self, upload, receipt):
+        self._write(
+            "INSERT INTO upload_receipts(id,space_id,visitor_id,grant_id,file_id,receipt,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (upload["id"], upload["space_id"], upload["visitor_id"], upload["grant_id"],
+             receipt["id"], json.dumps(receipt), now()))
 
     def part_path(self, upload_id: str) -> str:
         return os.path.join(self.partial_dir, upload_id + ".part")

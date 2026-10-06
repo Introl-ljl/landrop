@@ -65,7 +65,11 @@ def expand_paths(items: list[str]) -> list[str]:
     out: list[str] = []
     for item in items:
         item = os.path.expanduser(item)
-        matches = sorted(glob.glob(item)) if any(c in item for c in "*?[") else [item]
+        # 含通配符时先按字面路径找：真实文件名里带 [ ] * 的不应被当成 glob 展开
+        if any(c in item for c in "*?[") and not os.path.exists(item):
+            matches = sorted(glob.glob(item))
+        else:
+            matches = [item]
         if not matches:
             raise CliError(f"没有匹配：{item}")
         for m in matches:
@@ -129,10 +133,12 @@ def cmd_send(args) -> int:
     paths = expand_paths(args.files or pick_interactively())
     note = lambda m: print(f"  · {m}", file=sys.stderr)  # noqa: E731
     sender = DirectSender(paths, port=args.port, receivers=args.receivers, on_event=note)
-    print(f"准备 {len(sender.entries)} 个文件（{human(sender.total_bytes)}），计算校验值…",
-          file=sys.stderr)
-    sender.prepare_hashes()
+    print(f"准备 {len(sender.entries)} 个文件（{human(sender.total_bytes)}），"
+          f"监听端口 {sender.port}，校验值在后台计算…", file=sys.stderr)
+    for w in sender.warnings:
+        note(f"注意：{w}")
     sender.start()
+    sender.start_hashing()
     ips = [args.ip] if args.ip else lan_addresses()
     code = make_code(f"http://{ips[0]}:{sender.port}", sender.token)
     print()
@@ -148,6 +154,8 @@ def cmd_send(args) -> int:
     except KeyboardInterrupt:
         sender.stop("cancelled")
         reason = "cancelled"
+    if sender.hash_error:
+        note(f"警告：部分校验值计算失败（{sender.hash_error}），这些文件未提供校验")
     messages = {"done": "已送达，发送端退出", "timeout": "超时无人取件，已退出",
                 "failures": "错误尝试过多，已退出", "cancelled": "已取消"}
     print(messages.get(reason, reason), file=sys.stderr)
@@ -174,7 +182,8 @@ def cmd_get(args) -> int:
     def done(item, target):
         progress_end()
         last["name"] = None
-        print(f"✓ {target}  ({human(item['size'])}, 已校验 SHA-256)")
+        mark = "已校验 SHA-256" if item.get("verified") else "对端未提供校验值"
+        print(f"✓ {target}  ({human(item['size'])}，{mark})")
 
     fetch_files(args.code, directory, args.only, args.force, show, done)
     return 0

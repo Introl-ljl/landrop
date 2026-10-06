@@ -514,24 +514,27 @@ class SendPage(Page):
             try:
                 sender = direct.DirectSender(paths, receivers=receivers,
                                              on_event=lambda m: ui.call(self._event, m))
+                self.sender = sender
+                for warning in sender.warnings:
+                    ui.call(self._event, warning)
                 n = len(sender.entries)
                 done = [0]
 
                 def hashed(name):
-                    if self._cancel:
-                        raise Cancelled()
+                    if sender.finished.is_set():
+                        return
                     done[0] += 1
-                    ui.call(self._hash_progress, done[0], n, name)
+                    ui.call(self._hash_progress, done[0], n, name, sender)
 
-                sender.prepare_hashes(hashed)
+                sender.start()
                 if self._cancel:
                     raise Cancelled()
-                sender.start()
                 ips = self.ips or direct.lan_addresses()
                 ip = chosen if chosen != "auto" else ips[0]
                 code = common.make_code(f"http://{ip}:{sender.port}", sender.token)
                 ui.call(self._direct_ready, sender, code, [i for i in ips if i != ip], n, sender.total_bytes,
                         receivers, timeout)
+                sender.start_hashing(hashed)
                 reason = sender.wait(timeout * 60)
                 ui.call(self._direct_finished, reason)
             except Cancelled:
@@ -539,15 +542,22 @@ class SendPage(Page):
                     sender.stop("cancelled")
                 ui.call(self._direct_finished, "cancelled")
             except common.CliError as exc:
+                if sender is not None:
+                    sender.stop("cancelled")
                 ui.call(self._fail, str(exc))
             except Exception as exc:  # noqa: BLE001
+                if sender is not None:
+                    sender.stop("cancelled")
                 ui.call(self._fail, f"{type(exc).__name__}: {exc}")
 
         run_bg(work)
 
-    def _hash_progress(self, i, n, name):
+    def _hash_progress(self, i, n, name, sender):
+        if self.sender is not sender or sender.finished.is_set():
+            return
         self.progress.set(i / max(n, 1))
-        self.status.set(f"正在计算校验值 {i}/{n}：{W.elide(name, 48)}")
+        self.status.set("等待接收端连接…" if i == n else
+                        f"正在计算校验值 {i}/{n}：{W.elide(name, 48)}")
 
     def _direct_ready(self, sender, code, others, n, total, receivers, timeout):
         self.sender = sender
@@ -622,12 +632,16 @@ class SendPage(Page):
 
         def work():
             try:
-                res = remote.send_files(url, key, files, expire, "", "", progress, max_dl)
+                res = remote.send_files(url, key, files, expire, "", "", progress, max_dl,
+                                        lambda: self._cancel)
                 ui.call(self._server_done, res)
             except Cancelled:
                 ui.call(self._direct_finished, "cancelled")
             except common.CliError as exc:
-                ui.call(self._fail, str(exc))
+                if self._cancel:
+                    ui.call(self._direct_finished, "cancelled")
+                else:
+                    ui.call(self._fail, str(exc))
             except Exception as exc:  # noqa: BLE001
                 ui.call(self._fail, f"{type(exc).__name__}: {exc}")
 
@@ -962,7 +976,8 @@ class ReceivePage(Page):
         r = row(self.file_rows, pady=T.px(3))
         W.Icon(r, "check", size=14, color="accent").pack(side="left")
         W.label(r, W.elide(os.path.basename(target), 56), size=9).pack(side="left", padx=(T.px(8), 0))
-        W.label(r, f"{common.human(item['size'])} · SHA-256 已校验", role="muted", size=9).pack(side="right")
+        mark = "SHA-256 已校验" if item.get("verified") else "对端未提供校验值"
+        W.label(r, f"{common.human(item['size'])} · {mark}", role="muted", size=9).pack(side="right")
         kids = self.file_rows.winfo_children()
         for w in kids[:-12]:
             w.destroy()
