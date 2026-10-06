@@ -69,15 +69,18 @@ class DirectSender:
         self.receivers = max(1, receivers)
         self.max_failures = max_failures
         self.on_event = on_event or (lambda msg: None)
-        self.entries = self._collect(paths)
+        self.entries, self.warnings = self._collect(paths)
         if not self.entries:
             raise CliError("没有可发送的文件")
         self.finished = threading.Event()
         self.reason = ""
         self._lock = threading.Lock()
         self._sessions: set[str] = set()
+        self._sent: dict[str, set[str]] = {}    # 会话 → 已完整发出的文件 id（done 只认取齐的）
         self._failures = 0
         self._done = 0
+        self._ready = threading.Event()         # 校验值就绪前，登录/下载返回 503 让接收端等待
+        self.hash_error = ""
         self._hash_cache: dict[int, str] = {}
         self.httpd = _QuietServer((host, port), self._make_handler())
         self.port = self.httpd.server_address[1]
@@ -99,19 +102,41 @@ class DirectSender:
                             entries.append((full, rel))
             elif os.path.isfile(p):
                 entries.append((p, os.path.basename(p)))
-        out = []
+        out, used, warnings = [], set(), []
         for full, rel in entries:
-            if rel not in seen:
-                seen.add(rel)
-                out.append({"id": str(len(out)), "path": full, "name": rel,
-                            "size": os.path.getsize(full)})
-        return out
+            if rel in used:
+                # 同名文件不能静默丢弃：先带上父目录名区分，再不行就加序号
+                parent = os.path.basename(os.path.dirname(full.rstrip("/\\")))
+                alt = f"{parent}/{rel}" if parent and f"{parent}/{rel}" not in used else ""
+                if alt:
+                    warnings.append(f"重名：{rel} → 以 {alt} 发送")
+                else:
+                    stem, ext = os.path.splitext(rel)
+                    i = 1
+                    while f"{stem} ({i}){ext}" in used:
+                        i += 1
+                    alt = f"{stem} ({i}){ext}"
+                    warnings.append(f"重名：{rel} → 以 {alt} 发送")
+                rel = alt
+            used.add(rel)
+            out.append({"id": str(len(out)), "path": full, "name": rel,
+                        "size": os.path.getsize(full)})
+        return out, warnings
 
     def prepare_hashes(self, on_progress=None):
-        for e in self.entries:
-            e["sha256"] = sha256_file(e["path"])
-            if on_progress:
-                on_progress(e["name"])
+        try:
+            for e in self.entries:
+                e["sha256"] = sha256_file(e["path"])
+                if on_progress:
+                    on_progress(e["name"])
+        except OSError as exc:      # 文件中途消失等：发送继续，只是该文件没有校验值
+            self.hash_error = str(exc)
+        finally:
+            self._ready.set()
+
+    def start_hashing(self, on_progress=None):
+        """后台计算校验值，不再阻塞监听；就绪前接收端登录会得到 503 并自动等待。"""
+        threading.Thread(target=self.prepare_hashes, args=(on_progress,), daemon=True).start()
 
     @property
     def total_bytes(self) -> int:
@@ -169,14 +194,23 @@ class DirectSender:
                     n = 0
                 return self.rfile.read(min(n, 65536)) if n > 0 else b""
 
-            def _authed(self):
+            def _session(self):
                 jar = self.headers.get("Cookie") or ""
                 m = re.search(r"ld_direct=([A-Za-z0-9_-]+)", jar)
-                return bool(m) and m.group(1) in sender._sessions
+                return m.group(1) if m and m.group(1) in sender._sessions else None
+
+            def _authed(self):
+                return self._session() is not None
+
+            def _not_ready(self):
+                return self._json({"ok": False, "error": "发送端正在准备校验值，请稍候"},
+                                  503, headers={"Retry-After": "2"})
 
             def do_POST(self):
                 path = urllib.parse.urlparse(self.path).path
                 if path == "/api/login":
+                    if not sender._ready.is_set():
+                        return self._not_ready()
                     try:
                         key = str(json.loads(self._body() or b"{}").get("key") or "")
                     except ValueError:
@@ -200,15 +234,23 @@ class DirectSender:
                     return
                 if path == "/api/done":
                     self._body()
-                    if not self._authed():
+                    sid = self._session()
+                    if not sid:
                         return self._json({"ok": False, "error": "未登录"}, 401)
+                    all_ids = {e["id"] for e in sender.entries}
                     with sender._lock:
-                        sender._done += 1
-                        complete = sender._done >= sender.receivers
-                    self._json({"ok": True})
-                    sender.on_event("接收完成")
-                    if complete:
-                        sender.stop("done")
+                        # 只有取齐全部文件的接收者才消耗一个名额：--only 部分取件不算完成
+                        complete_fetch = all_ids <= sender._sent.get(sid, set())
+                        complete = False
+                        if complete_fetch:
+                            sender._sent.pop(sid, None)
+                            sender._done += 1
+                            complete = sender._done >= sender.receivers
+                    self._json({"ok": True, "complete": complete_fetch})
+                    if complete_fetch:
+                        sender.on_event("接收完成")
+                        if complete:
+                            sender.stop("done")
                     return
                 self._json({"ok": False, "error": "not found"}, 404)
 
@@ -216,6 +258,8 @@ class DirectSender:
                 parsed = urllib.parse.urlparse(self.path)
                 if not self._authed():
                     return self._json({"ok": False, "error": "未登录"}, 401)
+                if not sender._ready.is_set():
+                    return self._not_ready()
                 if parsed.path == "/api/files":
                     return self._json({"ok": True, "files": [
                         {"id": e["id"], "name": e["name"], "size": e["size"],
@@ -268,6 +312,10 @@ class DirectSender:
                             self.wfile.write(chunk)
                             left -= len(chunk)
                     if end >= size - 1:
+                        sid = self._session()   # 记录该会话已完整发出的文件，供 /api/done 判定
+                        if sid:
+                            with sender._lock:
+                                sender._sent.setdefault(sid, set()).add(entry["id"])
                         sender.on_event(f"已发送：{entry['name']}  ({human(size)})")
                 except (BrokenPipeError, ConnectionResetError):
                     pass

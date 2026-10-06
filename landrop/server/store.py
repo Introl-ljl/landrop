@@ -105,6 +105,12 @@ CREATE TABLE IF NOT EXISTS uploads (
   created_at    REAL NOT NULL,
   updated_at    REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS fetch_progress (
+  grant_id TEXT NOT NULL,
+  file_id  TEXT NOT NULL,
+  bytes    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (grant_id, file_id)
+);
 """
 
 
@@ -335,6 +341,29 @@ class Store:
             g = self.get_grant(grant_id)
         return bool(g and g["max_downloads"] is not None and g["downloads"] >= g["max_downloads"])
 
+    def record_fetch_bytes(self, grant_id: str, file_id: str, file_size: int, nbytes: int) -> bool:
+        """按服务端实际下发的字节统计一次性传输：某授权取齐空间内全部文件（每个文件的
+        累计下发字节都达到登记大小）才计一次完整取件。返回是否已用完次数。
+
+        不依赖接收端上报 /api/done，浏览器取件同样计入；只取部分文件（--only）不会误耗配额。
+        """
+        with self._write_lock:
+            self._write(
+                "INSERT INTO fetch_progress(grant_id,file_id,bytes) VALUES(?,?,?) "
+                "ON CONFLICT(grant_id,file_id) DO UPDATE SET bytes=bytes+excluded.bytes",
+                (grant_id, file_id, max(0, int(nbytes))),
+            )
+            done = self._one(
+                "SELECT COUNT(*) AS n FROM fetch_progress fp JOIN files f ON f.id=fp.file_id "
+                "WHERE fp.grant_id=? AND f.status='active' AND fp.bytes>=f.size", (grant_id,))
+            total = self._one(
+                "SELECT COUNT(*) AS n FROM files WHERE status='active' AND space_id="
+                "(SELECT space_id FROM grants WHERE id=?)", (grant_id,))
+            if not total["n"] or done["n"] < total["n"]:
+                return False
+            self._write("DELETE FROM fetch_progress WHERE grant_id=?", (grant_id,))
+            return self.record_download(grant_id)
+
     def list_transfers(self):
         rows = self._query(
             "SELECT g.*, s.id AS sid FROM grants g JOIN spaces s ON s.id=g.space_id "
@@ -519,9 +548,42 @@ class Store:
         ts = now()
         with self._write_lock:
             self._write("DELETE FROM sessions WHERE expires_at<?", (ts,))
-            self._write(
-                "DELETE FROM uploads WHERE updated_at<?", (ts - 3 * 86400,)
-            )
+            stale = self._query("SELECT id FROM uploads WHERE updated_at<?", (ts - 3 * 86400,))
+            for r in stale:                     # 行删掉之前先把对应的分块文件一并清掉
+                try:
+                    os.remove(self.part_path(r["id"]))
+                except OSError:
+                    pass
+            self._write("DELETE FROM uploads WHERE updated_at<?", (ts - 3 * 86400,))
+            self._write("DELETE FROM fetch_progress WHERE grant_id NOT IN (SELECT id FROM grants)")
+
+    def purge_orphan_parts(self, min_age: float = 600) -> int:
+        """清理 partial/ 下没有对应上传会话的分块文件（进程中断、传输被清理等留下的孤儿）。
+
+        min_age 秒内的新文件不动，避免与正在创建的上传竞态。"""
+        try:
+            names = os.listdir(self.partial_dir)
+        except OSError:
+            return 0
+        cutoff = now() - min_age
+        removed = 0
+        for fn in names:
+            if not fn.endswith(".part"):
+                continue
+            path = os.path.join(self.partial_dir, fn)
+            try:
+                if os.path.getmtime(path) >= cutoff:
+                    continue
+            except OSError:
+                continue
+            if self._one("SELECT 1 FROM uploads WHERE id=?", (fn[:-len(".part")],)):
+                continue
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+        return removed
 
     # ---------------------------------------------------------------- 文件
     def list_files(self, space_id: str, owner_visitor: str | None = None):

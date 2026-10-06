@@ -248,6 +248,10 @@ class Handler(BaseHTTPRequestHandler):
             arr = [t for t in _attempts.get(ip, []) if ts - t < ATTEMPT_WINDOW]
             arr.append(ts)
             _attempts[ip] = arr
+            if len(_attempts) > 4096:       # 顺带回收不再活跃的 IP，避免表无限增长
+                for k in [k for k, v in _attempts.items()
+                          if not v or ts - v[-1] >= ATTEMPT_WINDOW]:
+                    _attempts.pop(k, None)
 
     def _clear_attempts(self):
         with _attempts_lock:
@@ -347,8 +351,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/" and method in ("GET", "HEAD"):
                 return self.serve_static("index.html")
             if method in ("GET", "HEAD"):
-                rel = path.lstrip("/")
-                if rel and ".." not in rel.split("/"):
+                # 反斜杠在 Windows 上是路径分隔符：先归一成 "/" 再检查，否则 ..\..\ 能绕过
+                rel = path.lstrip("/").replace("\\", "/")
+                if (rel and ".." not in rel.split("/")
+                        and all(ord(c) >= 32 for c in rel)):
                     return self.serve_static(rel)
             self._drain_body()
             self._err(HTTPStatus.NOT_FOUND, "not found")
@@ -365,7 +371,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ 静态
     def serve_static(self, rel: str):
-        full = os.path.join(resource_dir(), rel)
+        base = os.path.realpath(resource_dir())
+        # 兜底：无论上层检查如何，解析后的真实路径必须仍在静态目录内（含盘符/UNC 等形态）
+        full = os.path.realpath(os.path.join(base, rel))
+        if full != base and not full.startswith(base + os.sep):
+            self._err(HTTPStatus.NOT_FOUND, "not found")
+            return
         if not os.path.isfile(full):
             self._err(HTTPStatus.NOT_FOUND, "not found")
             return
@@ -809,7 +820,10 @@ class Handler(BaseHTTPRequestHandler):
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
-        if self.command == "HEAD" or not size:
+        if self.command == "HEAD":
+            return
+        if not size:
+            self._count_transfer_bytes(auth, row, 0)
             return
         with open(full, "rb") as f:
             f.seek(start)
@@ -820,6 +834,19 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 left -= len(chunk)
+        self._count_transfer_bytes(auth, row, length - left)
+
+    def _count_transfer_bytes(self, auth, row, served: int):
+        """一次性传输的服务端取件计数：按实际下发字节累计，取齐全部文件即消耗一次配额。
+        不依赖客户端上报 /api/done，浏览器取件同样计入。"""
+        g = auth["grant"]
+        if g["kind"] != "share":
+            return
+        space = STORE.get_space(row["space_id"])
+        if space is None or not space["transient"]:
+            return
+        if STORE.record_fetch_bytes(g["id"], row["id"], row["size"] or 0, served):
+            log(f"传输取件次数已用完（按字节统计）  <- {self._client_ip()}  {g['id']}")
 
     @staticmethod
     def _inline_ok(ctype: str) -> bool:
@@ -1059,20 +1086,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": True, "transfers": STORE.list_transfers()})
 
     def api_done(self):
-        """接收端取完全部文件后调用：传输类授权据此累计次数，用完即失效并清理。
-        对普通分享链接与直连发送端的协议保持一致，是无害的空操作。"""
+        """接收端完成信号。直连发送端据此结束监听；一次性传输的次数由服务端按实际下发
+        字节统计（见 _count_transfer_bytes），这里不再计数，仅保持协议兼容。"""
         auth = self._auth()
         self._drain_body()
         if auth is None:
             return self._err(HTTPStatus.UNAUTHORIZED, "未登录")
-        g = auth["grant"]
-        exhausted = False
-        space = STORE.get_space(g["space_id"]) if g["space_id"] else None
-        if space is not None and space["transient"]:
-            exhausted = STORE.record_download(g["id"])
-            if exhausted:
-                log(f"传输已取完  <- {self._client_ip()}  {g['id']}")
-        self._send_json({"ok": True, "exhausted": exhausted})
+        self._send_json({"ok": True})
 
     def api_spaces_list(self):
         auth = self._require_admin()
@@ -1147,7 +1167,10 @@ def parse_args(argv=None):
                    help="对外访问地址（默认自动探测）；容器内请设为宿主机局域网地址，"
                         "如 http://192.168.1.10:8800，否则分享链接会指向容器内网地址")
     p.add_argument("--no-banner", action="store_true", help="不打印启动横幅（GUI 用）")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.reset_admin and not (args.admin_key or os.environ.get("LANDROP_ADMIN_KEY")):
+        p.error("--reset-admin 需要同时提供 --admin-key（或环境变量 LANDROP_ADMIN_KEY）")
+    return args
 
 
 def _start_janitor(interval: float = 60.0):
@@ -1158,9 +1181,10 @@ def _start_janitor(interval: float = 60.0):
             try:
                 if STORE is not None:
                     STORE.purge_expired()
+                    parts = STORE.purge_orphan_parts()
                     n = STORE.cleanup_transfers()
-                    if n:
-                        log(f"已清理 {n} 个失效传输")
+                    if n or parts:
+                        log(f"已清理 {n} 个失效传输、{parts} 个孤儿分块")
             except Exception as exc:  # noqa: BLE001
                 log(f"!! 清理任务出错: {exc!r}")
     threading.Thread(target=loop, daemon=True, name="janitor").start()

@@ -59,6 +59,7 @@ class SharePanels:
         self.files: list[str] = []
         self.sender: direct.DirectSender | None = None
         self.busy = False            # 发送中（直连等待 / 上传中）
+        self.cancel_ev = threading.Event()   # 经服务器上传的取消信号
         self.last_grant = ""
         self.font = ("Consolas", 10) if sys.platform.startswith("win") else ("Menlo", 11)
 
@@ -252,6 +253,7 @@ class SharePanels:
         self.s_code.set("")
         self.s_cmd.set("")
         self.s_bar["value"] = 0
+        self.cancel_ev.clear()
         self.s_log.configure(state="normal")
         self.s_log.delete("1.0", "end")
         self.s_log.configure(state="disabled")
@@ -261,6 +263,7 @@ class SharePanels:
             self._send_via_server()
 
     def do_cancel(self):
+        self.cancel_ev.set()
         if self.sender is not None:
             self.sender.stop("cancelled")
 
@@ -282,6 +285,13 @@ class SharePanels:
                 sender = direct.DirectSender(
                     paths, receivers=1,
                     on_event=lambda m: ui.call(self._log_send, "· " + m))
+                for w in sender.warnings:
+                    ui.call(self._log_send, "· 注意：" + w)
+                sender.start()          # 先监听：文件码立即可用，校验值后台补算
+                ips = direct.lan_addresses()
+                code = common.make_code(f"http://{ips[0]}:{sender.port}", sender.token)
+                ui.call(self._direct_ready, sender, code, ips,
+                        len(sender.entries), sender.total_bytes)
                 names = [e["name"] for e in sender.entries]
                 done = [0]
 
@@ -289,11 +299,7 @@ class SharePanels:
                     done[0] += 1
                     ui.call(self._hash_progress, done[0], len(names), name)
 
-                sender.prepare_hashes(hashed)
-                sender.start()
-                ips = direct.lan_addresses()
-                code = common.make_code(f"http://{ips[0]}:{sender.port}", sender.token)
-                ui.call(self._direct_ready, sender, code, ips, len(names), sender.total_bytes)
+                sender.start_hashing(hashed)
                 reason = sender.wait(timeout * 60)
                 ui.call(self._direct_finished, reason)
             except common.CliError as exc:
@@ -309,9 +315,9 @@ class SharePanels:
 
     def _direct_ready(self, sender, code, ips, n, total):
         self.sender = sender
-        self.s_bar["value"] = 100
         self._show_code(code, f"{common.cmd_prefix()} get {code}")
-        self.s_msg.set(f"等待接收端连接…（{n} 个文件，{common.human(total)}；一次性，取完自动结束）")
+        self.s_msg.set(f"等待接收端连接…（{n} 个文件，{common.human(total)}；"
+                       "校验值后台计算中，对方会自动等待）")
         self._log_send("提示：系统防火墙首次弹窗请选择「允许访问」；传输为明文 HTTP，仅限可信局域网。")
         if len(ips) > 1:
             self._log_send("其他可用地址（对方连不上时换一个 IP）：" +
@@ -347,7 +353,6 @@ class SharePanels:
             return
         files = list(self.files)
         self._set_busy(True)
-        self.cancel_btn.configure(state="disabled")
         self.s_msg.set("连接中…")
         ui = self.ui
 
@@ -356,14 +361,23 @@ class SharePanels:
 
         def work():
             try:
-                res = remote.send_files(url, key, files, expire, "", "", progress, max_dl)
+                res = remote.send_files(url, key, files, expire, "", "", progress, max_dl,
+                                        self.cancel_ev.is_set)
                 ui.call(self._server_done, res)
             except common.CliError as exc:
-                ui.call(self._fail, "发送失败", str(exc))
+                if self.cancel_ev.is_set() and "已取消" in str(exc):
+                    ui.call(self._server_cancelled)
+                else:
+                    ui.call(self._fail, "发送失败", str(exc))
             except Exception as exc:  # noqa: BLE001
                 ui.call(self._fail, "发送失败", f"{type(exc).__name__}: {exc}")
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _server_cancelled(self):
+        self._set_busy(False)
+        self.s_msg.set("已取消")
+        self._log_send("已取消上传；服务端会自动清理未完成的传输")
 
     def _upload_progress(self, name, done, total):
         self.s_bar["value"] = 100 if not total else done * 100 // total
@@ -455,7 +469,8 @@ class SharePanels:
             ui.call(self._recv_progress, name, done, total)
 
         def one(item, target):
-            ui.call(self._log_recv, f"✓ {target}  ({common.human(item['size'])}，已校验 SHA-256)\n")
+            mark = "已校验 SHA-256" if item.get("verified") else "对端未提供校验值"
+            ui.call(self._log_recv, f"✓ {target}  ({common.human(item['size'])}，{mark})\n")
 
         def work():
             try:
