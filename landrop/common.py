@@ -206,8 +206,10 @@ def file_version(path: str) -> str:
 
 
 def stat_version(stat) -> str:
+    # Windows stat/fstat disagree on ctime in newer Python; birthtime is consistent.
+    stamp = getattr(stat, "st_birthtime_ns", stat.st_ctime_ns) if os.name == "nt" else stat.st_ctime_ns
     return hashlib.sha256(str((stat.st_dev, stat.st_ino, stat.st_size,
-                               stat.st_mtime_ns, stat.st_ctime_ns)).encode()).hexdigest()[:32]
+                               stat.st_mtime_ns, stamp)).encode()).hexdigest()[:32]
 
 
 def collect_entries(paths: list[str], on_warning=None) -> list[tuple[str, str]]:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from contextlib import closing
 import hashlib
 import io
 import json
@@ -12,13 +13,14 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlencode
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from landrop.common import CliError, make_link, parse_target, sha256_file
+from landrop.common import CliError, make_link, parse_target, sha256_file, stat_version
 from landrop.remote import Client, download_file, list_remote, upload_file
 from landrop.server.app import Runtime
 from landrop.server.store import OverlapError, Store, TEXT_LIMIT
@@ -104,6 +106,19 @@ class Contracts(unittest.TestCase):
                             headers={"Range": "bytes=3-8", "If-Range": '"old"'}, raw=True) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.read(), self.file.read_bytes())
+
+    def test_file_versions_match_windows_path_and_descriptor(self):
+        fields = {"st_dev": 1, "st_ino": 2, "st_size": 3, "st_mtime_ns": 40, "st_birthtime_ns": 10}
+        by_path = SimpleNamespace(**fields, st_ctime_ns=10)
+        by_descriptor = SimpleNamespace(**fields, st_ctime_ns=20)
+        with patch("landrop.common.os.name", "nt"):
+            self.assertEqual(stat_version(by_path), stat_version(by_descriptor))
+            changed = SimpleNamespace(**dict(fields, st_mtime_ns=41), st_ctime_ns=20)
+            self.assertNotEqual(stat_version(by_path), stat_version(changed))
+            legacy = SimpleNamespace(**{k: v for k, v in fields.items() if k != "st_birthtime_ns"}, st_ctime_ns=10)
+            self.assertEqual(stat_version(by_path), stat_version(legacy))
+        with patch("landrop.common.os.name", "posix"):
+            self.assertNotEqual(stat_version(by_path), stat_version(by_descriptor))
 
     def test_scope_and_dynamic_directory(self):
         first = self.store.save_share(paths=[str(self.source)])
@@ -377,9 +392,10 @@ class Contracts(unittest.TestCase):
         self.assertEqual(set(history[0]), {"count", "directory", "time"})
         old = self.root / "legacy"
         old.mkdir()
-        with sqlite3.connect(str(old / "state.sqlite3")) as db:
+        with closing(sqlite3.connect(str(old / "state.sqlite3"))) as db:
             db.execute("CREATE TABLE grants(secret TEXT)")
             db.execute("INSERT INTO grants VALUES('old-credential')")
+            db.commit()
         (old / "admin-key.txt").write_text("old-credential", encoding="utf-8")
         (old / "desktop.json").write_text(json.dumps({"theme": "dark", "port": "8999"}), encoding="utf-8")
         preserved = old / "files"
