@@ -1,298 +1,301 @@
-#!/usr/bin/env python3
-"""LAN Drop 命令行。
-
-    landrop send a.zip dir/        直连发送：生成文件码并等待对方取件（无需服务）
-    landrop get <文件码> [-o 目录]  用文件码取件
-    landrop serve [--data-dir …]   在本机启动收集服务（网页 + CLI）
-    landrop send --server URL …    上传到常驻服务，生成一次性取件码
-    landrop revoke <ID>            撤销一个传输/分享
-    landrop gui                    打开桌面窗口（与安装包里的 LAN Drop 是同一个程序）
-"""
+"""Local share management and the same six-digit receive/collection protocol as the web UI."""
 from __future__ import annotations
 
 import argparse
 import glob
+import json
+import math
 import os
+import signal
 import sys
+import time
 
 from . import __version__
-from .common import (CliError, collect_entries, human, make_code, normalize_base, progress,
-                     progress_end, setup_console, cmd_prefix)
-from .direct import DirectSender, lan_addresses
-from .remote import fetch_files, list_remote, read_admin_key, revoke, send_files
-
-DEFAULT_URL = "http://127.0.0.1:8000"
+from . import common, remote
+from .server.app import Runtime
+from .server.store import Store, TEXT_LIMIT
 
 
-def find_admin_key(args) -> str:
-    if args.key:
-        return args.key
-    if os.environ.get("LANDROP_ADMIN_KEY"):
-        return os.environ["LANDROP_ADMIN_KEY"]
-    return read_admin_key(args.data_dir)
-
-
-def pick_interactively() -> list[str]:
-    if not sys.stdin.isatty():
-        raise CliError(f"没有指定文件。用法：{cmd_prefix()} send 文件或文件夹 [...]")
-    files = sorted(p for p in os.listdir(".") if os.path.isfile(p))
-    if not files:
-        raise CliError("当前目录没有文件可选")
-    print("当前目录的文件：")
-    for i, name in enumerate(files, 1):
-        print(f"  {i:>3}. {name}  ({human(os.path.getsize(name))})")
-    raw = input("选择编号（如 1 3 5-7，a=全部）：").strip().lower()
-    if raw in ("a", "all", "*"):
-        return files
-    chosen: list[str] = []
-    for part in raw.replace(",", " ").split():
-        lo, _, hi = part.partition("-")
-        try:
-            a, b = int(lo), int(hi or lo)
-        except ValueError:
-            raise CliError(f"看不懂的编号：{part}") from None
-        for n in range(a, b + 1):
-            if not 1 <= n <= len(files):
-                raise CliError(f"编号超出范围：{n}")
-            if files[n - 1] not in chosen:
-                chosen.append(files[n - 1])
-    if not chosen:
-        raise CliError("没有选择任何文件")
-    return chosen
-
-
-def expand_paths(items: list[str]) -> list[str]:
-    out: list[str] = []
+def expand_paths(items):
+    result = []
     for item in items:
         item = os.path.expanduser(item)
-        # 含通配符时先按字面路径找：真实文件名里带 [ ] * 的不应被当成 glob 展开
-        if any(c in item for c in "*?[") and not os.path.exists(item):
-            matches = sorted(glob.glob(item))
-        else:
-            matches = [item]
+        matches = sorted(glob.glob(item)) if not os.path.exists(item) and any(ch in item for ch in "*?[") else [item]
         if not matches:
-            raise CliError(f"没有匹配：{item}")
-        for m in matches:
-            if not (os.path.isfile(m) or os.path.isdir(m)):
-                raise CliError(f"文件不存在：{m}")
-            ap = os.path.abspath(m)
-            if ap not in out:
-                out.append(ap)
-    return out
+            raise common.CliError(f"没有匹配：{item}")
+        for path in matches:
+            if not os.path.isfile(path) and not os.path.isdir(path):
+                raise common.CliError(f"文件或目录不存在：{path}")
+            path = os.path.abspath(path)
+            if path not in result:
+                result.append(path)
+    return result
 
 
-def print_code(code: str, qr: bool = False):
-    """send 的输出：文件码、取件命令、浏览器网址（窗口里的发送页显示的是同样三样）。"""
-    url = code if code.startswith(("http://", "https://")) else "http://" + code
-    print(f"文件码:  {code}")
-    print(f"取件命令: {cmd_prefix()} get {code}")
-    print("          （加 -o <目录> 指定保存位置，默认保存到运行命令时所在目录）")
-    print(f"浏览器:  {url}   （手机 / 没装 LAN Drop 的设备直接打开即可下载）")
+def pick_files():
+    if not sys.stdin.isatty():
+        raise common.CliError("请选择文件，或使用 --upload 创建收集、--text 发布文本")
+    choices = sorted(path for path in os.listdir(".") if os.path.isfile(path) or os.path.isdir(path))
+    for index, name in enumerate(choices, 1):
+        print(f"{index:>3}. {name}")
+    value = input("选择编号（空格分隔，a=全部）：").strip()
+    if value.lower() == "a":
+        return choices
+    try:
+        result = [choices[int(part) - 1] for part in value.split() if 1 <= int(part) <= len(choices)]
+    except (ValueError, IndexError):
+        raise common.CliError("编号不正确") from None
+    if not result:
+        raise common.CliError("没有选择文件")
+    return result
+
+
+def read_text(args):
+    if args.text_file:
+        with open(os.path.expanduser(args.text_file), "rb") as stream:
+            raw = stream.read(TEXT_LIMIT + 1)
+    elif args.text == "-":
+        raw = sys.stdin.buffer.read(TEXT_LIMIT + 1)
+    elif args.text is not None:
+        return args.text
+    else:
+        return None
+    if len(raw) > TEXT_LIMIT:
+        raise common.CliError("单条文本上限为 10 MiB")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise common.CliError("文本须为 UTF-8 编码") from None
+
+
+def share_options(parser, editing=False):
+    parser.add_argument("--label", help="分享名称")
+    parser.add_argument("--expire", type=float, help="有效小时数，0=长期")
+    parser.add_argument("--dir", dest="collection_base", help="收集目录，任务子目录自动创建")
+    parser.add_argument("--confirm-overlap", action="store_true", help="确认整目录分享可能公开私密收集内容")
+    for name, help_text in (("upload", "允许上传文件和提交文本"), ("public", "公开收到的文件和文本")):
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument("--" + name, action="store_true", default=None, help=help_text)
+        if editing:
+            group.add_argument("--no-" + name, dest=name, action="store_false")
+    text = parser.add_mutually_exclusive_group()
+    text.add_argument("--text", help="发布文本，- 从标准输入读取")
+    text.add_argument("--text-file", help="读取 UTF-8 文本文件")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="landrop", description="LAN Drop：本机分享、设备互传与收集")
+    parser.add_argument("--version", action="version", version=f"landrop {__version__}")
+    parser.add_argument("--data-dir", help="本机状态目录，也可用 LANDROP_DATA_DIR")
+    commands = parser.add_subparsers(dest="command")
+    send = commands.add_parser("send", help="创建分享，必要时启动本机服务")
+    send.add_argument("files", nargs="*")
+    send.add_argument("--qr", action="store_true")
+    share_options(send)
+    shares = commands.add_parser("shares", help="在本机查看、修改、停用或删除分享")
+    shares.add_argument("id", nargs="?")
+    shares.add_argument("--files", nargs="*", help="替换共享文件列表；留空清空列表")
+    shares.add_argument("--json", action="store_true")
+    shares.add_argument("--yes", action="store_true", help="确认删除分享或清空文本")
+    actions = shares.add_mutually_exclusive_group()
+    for action in ("enable", "disable", "delete", "rotate", "clear-text"):
+        actions.add_argument("--" + action, action="store_true")
+    share_options(shares, editing=True)
+    get = commands.add_parser("get", help="用地址和授权码或便捷链接接收文件")
+    get.add_argument("address")
+    get.add_argument("--code", default="")
+    get.add_argument("-o", "--output", default=".")
+    get.add_argument("--list", action="store_true")
+    get.add_argument("--only", nargs="+")
+    get.add_argument("-f", "--force", action="store_true", help="明确覆盖同名文件")
+    put = commands.add_parser("put", help="向允许上传的分享投递文件或文本")
+    put.add_argument("address")
+    put.add_argument("files", nargs="*")
+    put.add_argument("--code", default="")
+    text = put.add_mutually_exclusive_group()
+    text.add_argument("--text")
+    text.add_argument("--text-file")
+    serve = commands.add_parser("serve", help="启动本机服务，Ctrl-C 停止，不自动撤销分享")
+    serve.add_argument("--port", type=int)
+    serve.add_argument("--ip", help="访问地址，默认自动识别")
+    serve.add_argument("--collect-dir", help="设置默认收集目录（容器使用持久卷内目录）")
+    serve.add_argument("--open-browser", action="store_true")
+    commands.add_parser("stop", help="停止同一状态目录下的本机服务")
+    settings = commands.add_parser("settings", help="查看或调整本机设置")
+    settings.add_argument("--port", type=int)
+    settings.add_argument("--ip", help="网卡地址，auto=自动")
+    settings.add_argument("--collect-dir")
+    settings.add_argument("--recv-dir")
+    settings.add_argument("--text-preview-mib", type=int)
+    settings.add_argument("--image-preview-mib", type=int)
+    settings.add_argument("--theme", choices=("system", "light", "dark"))
+    settings.add_argument("--clear-history", action="store_true")
+    commands.add_parser("gui", help="打开三页桌面窗口，不自动启动服务")
+    for command in commands.choices.values():
+        command.add_argument("--data-dir", default=argparse.SUPPRESS)
+    return parser
+
+
+def _options(args):
+    values = {"label": args.label, "allow_upload": args.upload, "public_received": args.public,
+              "collection_base": args.collection_base, "confirm_overlap": args.confirm_overlap}
+    if args.expire is not None:
+        if not math.isfinite(args.expire) or args.expire < 0:
+            raise common.CliError("有效期须为非负小时数")
+        values["expires_at"] = time.time() + args.expire * 3600 if args.expire else None
+    return values
+
+
+def _print_share(store, runtime, share, qr=False):
+    info = runtime.info
+    ip = store.settings()["ip"] or common.lan_addresses()[0]
+    ip = f"[{ip}]" if ":" in ip else ip
+    base = info["base"] if info else f"http://{ip}:{store.settings()['port']}"
+    print(f"分享: {share['label']}\nID: {share['id']}\n访问地址: {base}\n授权码: {share['code']}")
+    print(f"便捷链接: {common.make_link(base, share['code'])}")
+    if not info:
+        print("服务未启动，运行 landrop serve 后可访问")
     if qr:
         from .qr import encode, to_terminal
-        print()
-        print(to_terminal(encode(url)))
-        print("          手机扫码下载")
+        print(to_terminal(encode(common.make_link(base, share["code"]))))
 
 
-def cmd_send_via_server(args) -> int:
-    paths = expand_paths(args.files or pick_interactively())
-    entries = collect_entries(paths)
-    total_bytes = sum(os.path.getsize(full) for full, _ in entries)
-    print(f"上传 {len(entries)} 个文件（{human(total_bytes)}）到 {normalize_base(args.server)} …",
-          file=sys.stderr)
-
-    last = {"name": None}
-
-    def show(name, done, total):
-        if last["name"] not in (None, name):
-            progress_end()
-        last["name"] = name
-        progress(name, done, total)
-
-    try:
-        res = send_files(args.server, find_admin_key(args), paths, args.expire, args.label,
-                         args.public_url or "", show, args.max_downloads)
-    except KeyboardInterrupt:
-        print("\n发送中断，传输空间里可能残留已上传的文件", file=sys.stderr)
-        return 130
-    progress_end()
-    print()
-    print_code(res["code"], args.qr)
-    exp = f"{args.expire:g} 小时后过期" if args.expire else "永不过期"
-    times = f"可取 {args.max_downloads} 次" if args.max_downloads else "取件次数不限"
-    print(f"共 {res['count']} 个文件，{human(res['bytes'])}，{exp}，{times}；"
-          f"到期/取完后服务端自动清理；撤销：{cmd_prefix()} revoke {res['grant_id']}")
-    return 0
-
-
-def cmd_send(args) -> int:
-    """默认直连：本机临时监听，等对方 get；加 --server 才走常驻服务。"""
-    if args.server:
-        return cmd_send_via_server(args)
-    paths = expand_paths(args.files or pick_interactively())
-    note = lambda m: print(f"  · {m}", file=sys.stderr)  # noqa: E731
-    sender = DirectSender(paths, port=args.port, receivers=args.receivers, on_event=note)
-    print(f"准备 {len(sender.entries)} 个文件（{human(sender.total_bytes)}），"
-          f"监听端口 {sender.port}，校验值在后台计算…", file=sys.stderr)
-    for w in sender.warnings:
-        note(f"注意：{w}")
-    sender.start()
-    sender.start_hashing()
-    ips = [args.ip] if args.ip else lan_addresses()
-    code = make_code(f"http://{ips[0]}:{sender.port}", sender.token)
-    print()
-    print_code(code, args.qr)
-    if len(ips) > 1 and not args.ip:
-        print("          其他可用地址（若上面的对方连不上，换一个 IP 再试）：" +
-              "  ".join(f"{ip}:{sender.port}" for ip in ips[1:]))
-    print(f"等待接收端连接… 一次性，{args.timeout:g} 分钟内无人取件将自动退出；Ctrl-C 取消。")
-    print("提示：首次监听时系统防火墙可能弹窗，请选择「允许访问」；传输为明文 HTTP，仅限可信局域网。",
-          file=sys.stderr)
-    try:
-        reason = sender.wait(args.timeout * 60)
-    except KeyboardInterrupt:
-        sender.stop("cancelled")
-        reason = "cancelled"
-    if sender.hash_error:
-        note(f"警告：部分校验值计算失败（{sender.hash_error}），这些文件未提供校验")
-    messages = {"done": "已送达，发送端退出", "timeout": "超时无人取件，已退出",
-                "failures": "错误尝试过多，已退出", "cancelled": "已取消"}
-    print(messages.get(reason, reason), file=sys.stderr)
-    return {"done": 0, "cancelled": 130}.get(reason, 1)
-
-
-def cmd_get(args) -> int:
-    if args.list:
-        cli, files = list_remote(args.code, args.only)
-        print(f"{cli.base} 上共 {len(files)} 个文件：", file=sys.stderr)
-        for f in files:
-            print(f"{f['name']}  {human(f['size'])}  sha256={f['sha256'][:12]}…")
-        return 0
-    directory = os.path.abspath(os.path.expanduser(args.output or "."))
-    print(f"→ {directory}", file=sys.stderr)
-    last = {"name": None}
-
-    def show(name, done, total):
-        if last["name"] not in (None, name):
-            progress_end()
-        last["name"] = name
-        progress(name, done, total)
-
-    def done(item, target):
-        progress_end()
-        last["name"] = None
-        mark = "已校验 SHA-256" if item.get("verified") else "对端未提供校验值"
-        print(f"✓ {target}  ({human(item['size'])}，{mark})")
-
-    fetch_files(args.code, directory, args.only, args.force, show, done)
-    return 0
-
-
-def cmd_revoke(args) -> int:
-    revoke(args.server, find_admin_key(args), args.grant_id)
-    print(f"已撤销 {args.grant_id}，文件码立即失效")
-    return 0
-
-
-def cmd_serve(rest: list[str]) -> int:
-    """启动收集服务：参数原样交给服务端（--data-dir / --port / --dir / --import …）。"""
-    from .server import app
-    return app.main(rest) or 0
-
-
-def cmd_gui(args) -> int:
-    try:
-        from .gui import launcher
-    except ImportError as exc:
-        raise CliError(f"图形界面不可用（需要带 tkinter 的 Python）：{exc}") from None
-    return launcher.main(["--autostart"] if args.autostart else []) or 0
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="landrop", description="LAN Drop：局域网文件互传与收集")
-    p.add_argument("--version", action="version", version=f"landrop {__version__}")
-    sub = p.add_subparsers(dest="cmd", metavar="命令")
-
-    s = sub.add_parser("send", help="直连发送：生成文件码并等待对方 get（无需服务）；--server 则上传到常驻服务")
-    s.add_argument("files", nargs="*", help="文件或目录（可用通配符）；省略则交互选择")
-    s.add_argument("--ip", help="直连模式：写进文件码的本机地址（默认自动探测；多网卡/VPN 时指定）")
-    s.add_argument("--port", type=int, default=0, help="直连模式：监听端口（默认随机）")
-    s.add_argument("--receivers", type=int, default=1, metavar="N", help="直连模式：允许 N 个接收者取完后退出（默认 1）")
-    s.add_argument("--timeout", type=float, default=30, metavar="分钟", help="直连模式：无人取件的等待时长（默认 30）")
-    s.add_argument("--server", default=os.environ.get("LANDROP_URL"),
-                   help="改为上传到常驻服务（地址如 http://192.168.1.5:8000，或环境变量 LANDROP_URL）")
-    s.add_argument("--public-url", help="--server 模式：写进文件码里的对外地址")
-    s.add_argument("--key", help="管理员密钥（或环境变量 LANDROP_ADMIN_KEY）")
-    s.add_argument("--data-dir", help="数据目录，从中读取 admin-key.txt（默认 ./data，其次平台默认目录）")
-    s.add_argument("--expire", type=float, default=24, metavar="小时",
-                   help="--server 模式：文件码有效小时数，0 表示永不过期（默认 24）")
-    s.add_argument("--max-downloads", type=int, default=1, metavar="N",
-                   help="--server 模式：最多被完整取件几次，0 表示不限（默认 1，即一次性）")
-    s.add_argument("--label", help="这批文件的备注（默认用文件名）")
-    s.add_argument("--qr", action="store_true", help="在终端里显示二维码（手机扫码用浏览器下载）")
-    s.set_defaults(fn=cmd_send)
-
-    g = sub.add_parser("get", help="用文件码把文件下载到当前目录（或 -o 指定目录）")
-    g.add_argument("code", help="文件码，形如 192.168.1.5:8000/令牌")
-    g.add_argument("-o", "--output", metavar="目录", help="保存目录（默认当前目录，不存在会创建）")
-    g.add_argument("--only", nargs="+", metavar="文件名", help="只下载指定文件名")
-    g.add_argument("--list", action="store_true", help="只列出文件，不下载")
-    g.add_argument("-f", "--force", action="store_true", help="同名文件直接覆盖（默认自动改名）")
-    g.set_defaults(fn=cmd_get)
-
-    sub.add_parser("serve", help="在本机启动收集服务（网页 + CLI；参数见 landrop serve --help）",
-                   add_help=False)
-
-    gui = sub.add_parser("gui", help="打开桌面窗口")
-    gui.add_argument("--autostart", action="store_true", help="打开后立即启动收集服务")
-    gui.set_defaults(fn=cmd_gui)
-
-    r = sub.add_parser("revoke", help="撤销一个文件码（需要管理员密钥）")
-    r.add_argument("grant_id", help="send 结束时打印的授权 ID（gs_…）")
-    r.add_argument("--server", default=os.environ.get("LANDROP_URL", DEFAULT_URL))
-    r.add_argument("--key")
-    r.add_argument("--data-dir")
-    r.set_defaults(fn=cmd_revoke)
-    return p
-
-
-def _pause_if_double_clicked():
-    """Windows 上在资源管理器里双击 landrop.exe：控制台窗口一闪而过。只有本进程用这个控制台时停一下。"""
-    if not sys.platform.startswith("win") or not sys.stdin or not sys.stdin.isatty():
+def _confirm(args):
+    if args.yes:
         return
+    if not sys.stdin.isatty() or input("将移除分享配置/文本，不删除磁盘文件。确认？[y/N] ").lower() != "y":
+        raise common.CliError("未确认；自动化操作请明确添加 --yes")
+
+
+def _wait(runtime):
+    def interrupt(_signal, _frame):
+        raise KeyboardInterrupt
+    previous = signal.signal(signal.SIGTERM, interrupt)
     try:
-        import ctypes
-        if ctypes.windll.kernel32.GetConsoleProcessList((ctypes.c_uint * 2)(), 2) <= 1:
-            input("这是命令行工具，请在终端里使用；想要图形界面请打开 LAN Drop。按回车键关闭…")
-    except Exception:  # noqa: BLE001
-        pass
+        while runtime.running:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        runtime.stop()
+        print("\n服务已停止，分享配置与文件保留")
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
-def main(argv=None) -> int:
-    setup_console()
-    argv = sys.argv[1:] if argv is None else list(argv)
-    if argv and argv[0] == "serve":     # 参数原样交给服务端，避免被本解析器截走
-        try:
-            return cmd_serve(argv[1:])
-        except CliError as exc:
-            print(f"错误：{exc}", file=sys.stderr)
-            return 1
+def main(argv=None):
+    common.setup_console()
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not getattr(args, "fn", None):        # 不带命令：给出用法，而不是一行报错
+    if not args.command:
         parser.print_help()
-        print(f"\n例：{cmd_prefix()} send a.zip    {cmd_prefix()} get <文件码>    {cmd_prefix()} gui")
-        _pause_if_double_clicked()
         return 0
+    if args.command == "gui":
+        if args.data_dir:
+            os.environ["LANDROP_DATA_DIR"] = common.resolve_data_dir(args.data_dir)[0]
+        from .gui.launcher import main as gui_main
+        return gui_main([])
+    store = runtime = None
     try:
-        return args.fn(args)
-    except CliError as exc:
+        store = Store(common.resolve_data_dir(args.data_dir)[0])
+        runtime = Runtime(store)
+        if args.command == "send":
+            text = read_text(args)
+            paths = args.files or ([] if args.upload or text is not None else pick_files())
+            share = store.save_share(paths=expand_paths(paths), text=text, **_options(args))
+            info = runtime.start()
+            _print_share(store, runtime, share, args.qr)
+            if runtime.httpd:
+                print("本机服务持续运行；Ctrl-C 停止服务，不删除分享或文件。")
+                _wait(runtime)
+        elif args.command == "serve":
+            if args.collect_dir:
+                store.configure(collect_dir=args.collect_dir)
+            runtime.start(args.port, args.ip)
+            print(f"访问地址: {runtime.info['base']}")
+            print("Ctrl-C 停止服务，已有分享和文件保留。")
+            if args.open_browser:
+                import webbrowser
+                webbrowser.open(runtime.info["local_url"])
+            if runtime.httpd:
+                _wait(runtime)
+        elif args.command == "stop":
+            runtime.stop()
+            print("本机服务已停止，分享和文件保留")
+        elif args.command == "shares":
+            if not args.id:
+                shares = store.shares()
+                if args.json:
+                    print(json.dumps(shares, ensure_ascii=False))
+                else:
+                    for share in shares:
+                        print(f"{share['id']}  {share['code']}  {'启用' if share['active'] else '停用/过期'}  {share['label']}")
+            elif args.delete or args.clear_text:
+                _confirm(args)
+                (store.delete_share if args.delete else store.clear_texts)(args.id)
+                print("已处理，磁盘文件保留")
+            else:
+                if args.enable or args.disable:
+                    share = store.set_enabled(args.id, args.enable)
+                elif args.rotate:
+                    share = store.rotate(args.id)
+                elif any(value is not None for value in (args.files, args.label, args.upload, args.public,
+                                                         args.expire, args.collection_base)):
+                    share = store.save_share(args.id, paths=expand_paths(args.files) if args.files is not None else None,
+                                             **_options(args))
+                else:
+                    share = store.share(args.id)
+                text = read_text(args)
+                if text is not None:
+                    store.add_text(share["id"], text)
+                _print_share(store, runtime, share)
+        elif args.command == "get":
+            if args.list:
+                client, files = remote.list_remote(args.address, args.code, args.only, args.data_dir)
+                for item in files:
+                    print(f"{item['name']}  {common.human(item['size'])}")
+                for item in client.content["texts"]:
+                    print(f"文本 {item['id']}  {common.human(item['size'])}")
+            else:
+                directory = os.path.abspath(os.path.expanduser(args.output))
+                saved = remote.fetch_files(args.address, directory, args.only, args.force,
+                                           on_done=lambda item, target: print(f"已接收: {target}"),
+                                           code=args.code, data_dir=args.data_dir)
+                common.progress_end()
+                store.record_receive(len(saved), directory)
+        elif args.command == "put":
+            client, _ = remote.list_remote(args.address, args.code, data_dir=args.data_dir)
+            text = read_text(args)
+            if not args.files and text is None:
+                raise common.CliError("请选择文件或提供文本")
+            for path, rel in common.collect_entries(expand_paths(args.files)):
+                result = remote.upload_file(client, path, rel=rel)
+                common.progress_end()
+                print(f"已投递: {result['name']}")
+            if text is not None:
+                client.submit_text(text)
+                print("文本已提交")
+        elif args.command == "settings":
+            values = {key: getattr(args, key) for key in
+                      ("port", "ip", "collect_dir", "recv_dir", "text_preview_mib", "image_preview_mib", "theme")
+                      if getattr(args, key) is not None}
+            if runtime.running and any(key in values for key in ("port", "ip")):
+                raise common.CliError("修改网络配置前请先运行 landrop stop，再手动启动服务")
+            if values.get("ip") == "auto":
+                values["ip"] = ""
+            if args.clear_history:
+                values["receive_history"] = []
+            print(json.dumps(store.configure(**values) if values else store.settings(), ensure_ascii=False, indent=2))
+        return 0
+    except (common.CliError, OSError, ValueError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\n已取消", file=sys.stderr)
         return 130
+    finally:
+        if runtime:
+            runtime.close()
+        if store:
+            store.close()
 
 
 if __name__ == "__main__":

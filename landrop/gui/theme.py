@@ -1,8 +1,5 @@
 # -*- coding: utf-8 -*-
-"""桌面窗口的设计令牌：与网页（static/index.html「流光玻璃」）同一套配色，浅色 / 深色两套。
-
-只依赖标准库。颜色都是不透明的十六进制值（Tk 不支持半透明），由网页里的 rgba 预先混合到底色上得到。
-"""
+"""Desktop colors and typography, shared with the restrained LAN browser UI."""
 from __future__ import annotations
 
 import os
@@ -10,60 +7,60 @@ import subprocess
 import sys
 
 LIGHT = {
-    "bg": "#f4f3f0",            # 内容区底色（暖白纸面）
-    "sidebar": "#ebe9e4",
+    "bg": "#f5f7f6",
+    "sidebar": "#edf0ef",
     "surface": "#ffffff",        # 卡片
-    "surface2": "#f6f5f2",       # 输入框、次级填充
-    "surface3": "#eceae5",       # 分段控件轨道、进度条轨道
-    "line": "#e3e1db",
-    "line2": "#d2cfc7",
-    "text": "#15171c",
-    "text2": "#464a53",
-    "muted": "#70747d",
-    "accent": "#0fc39d",
-    "accent_hover": "#0db08d",
-    "accent_press": "#0a9b7c",
-    "accent_ink": "#032019",
-    "accent_text": "#087a64",
-    "accent_soft": "#dcf5ee",
-    "accent_soft_hover": "#c9efe4",
+    "surface2": "#f3f5f4",
+    "surface3": "#e4eae6",
+    "line": "#d9e1dd",
+    "line2": "#c4cfc8",
+    "text": "#18231e",
+    "text2": "#3d4c43",
+    "muted": "#617169",
+    "accent": "#246b48",
+    "accent_hover": "#1e603f",
+    "accent_press": "#185334",
+    "accent_ink": "#ffffff",
+    "accent_text": "#246b48",
+    "accent_soft": "#edf5ef",
+    "accent_soft_hover": "#dfede3",
     "danger": "#d93541",
     "danger_soft": "#fbe4e6",
     "warn": "#b7791f",
     "warn_soft": "#fbf0dc",
-    "hover": "#efede8",
-    "press": "#e6e4de",
+    "hover": "#eaf0ed",
+    "press": "#dce7e0",
     "nav_active": "#ffffff",
-    "focus": "#0fc39d",
-    "shadow": "#e6e4df",
+    "focus": "#346fc0",
+    "shadow": "#dce3df",
 }
 
 DARK = {
-    "bg": "#0d0f13",
-    "sidebar": "#090a0d",
-    "surface": "#16191f",
-    "surface2": "#1c2027",
-    "surface3": "#232833",
-    "line": "#262b33",
-    "line2": "#343a45",
-    "text": "#eceef2",
-    "text2": "#b8bec8",
-    "muted": "#868c96",
-    "accent": "#2fe6bd",
-    "accent_hover": "#5cf0cf",
-    "accent_press": "#22c9a4",
-    "accent_ink": "#032019",
-    "accent_text": "#5ceecd",
-    "accent_soft": "#163b35",
-    "accent_soft_hover": "#1c4a42",
+    "bg": "#161b18",
+    "sidebar": "#121713",
+    "surface": "#202722",
+    "surface2": "#252e28",
+    "surface3": "#303b33",
+    "line": "#39453d",
+    "line2": "#49564d",
+    "text": "#edf3ee",
+    "text2": "#c8d4cd",
+    "muted": "#b2beb6",
+    "accent": "#80c89c",
+    "accent_hover": "#9dd8b3",
+    "accent_press": "#6fb689",
+    "accent_ink": "#15221a",
+    "accent_text": "#80c89c",
+    "accent_soft": "#293d30",
+    "accent_soft_hover": "#354c3d",
     "danger": "#ff6b74",
     "danger_soft": "#3a1d21",
     "warn": "#f2b84b",
     "warn_soft": "#3a2e17",
-    "hover": "#1d2128",
-    "press": "#242932",
-    "nav_active": "#1c2027",
-    "focus": "#2fe6bd",
+    "hover": "#2b362e",
+    "press": "#364239",
+    "nav_active": "#252e28",
+    "focus": "#6c9bdc",
     "shadow": "#07080a",
 }
 

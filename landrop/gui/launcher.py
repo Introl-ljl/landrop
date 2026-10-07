@@ -1,52 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""LAN Drop 桌面窗口（Windows / macOS / Linux，仅依赖标准库 tkinter）。
-
-布局参照 LocalSend：左侧导航（发送 / 接收 / 收集服务 / 设置），右侧卡片式内容；
-配色与网页共用一套设计令牌（theme.py），支持浅色 / 深色并跟随系统。
-
-窗口与命令行是同一个程序的两个入口：安装包里 ``LAN Drop``（窗口）与 ``landrop``（命令行）
-共用一份运行时，``landrop gui`` 也能打开本窗口。
-"""
+"""Three-page desktop launcher. Local management never passes through the LAN HTTP API."""
 from __future__ import annotations
 
 import os
 import sys
+import threading
 import traceback
 
 from landrop import __version__
+from landrop.common import lan_addresses, resolve_data_dir
+from landrop.server.app import Runtime
+from landrop.server.store import Store
 
 from . import system
 from . import widgets as W
 from .theme import T, enable_dpi_awareness, style_titlebar
-
-
-class LogTee:
-    """把服务端日志（print 到 stdout）同时送到原输出和窗口里的「服务日志」。"""
-
-    def __init__(self, original, sink):
-        self.original, self.sink = original, sink
-        self.encoding = "utf-8"
-
-    def write(self, text):
-        if self.original is not None:
-            try:
-                self.original.write(text)
-            except Exception:  # noqa: BLE001
-                pass
-        if text:
-            self.sink(text)
-        return len(text)
-
-    def flush(self):
-        if self.original is not None:
-            try:
-                self.original.flush()
-            except Exception:  # noqa: BLE001
-                pass
-
-    def isatty(self):
-        return False
 
 
 class NavItem(W.Canvas):
@@ -105,19 +74,21 @@ class NavItem(W.Canvas):
 
 
 class LauncherApp:
-    """主窗口。配置可用环境变量预填（脚本 / 测试用）：
-    ``LANDROP_DATA_DIR`` / ``LANDROP_SHARE_DIR`` / ``LANDROP_PORT`` / ``LANDROP_SCOPE`` / ``LANDROP_URL``
-    """
+    """Window and local CLI use the same model and service owner."""
 
-    PAGES = ("send", "receive", "service", "settings")
+    PAGES = ("share", "receive", "settings")
 
     def __init__(self):
         import tkinter as tk
         from . import panels
         enable_dpi_awareness()
-        self.settings = system.load_settings()
+        self.store = Store(resolve_data_dir()[0])
+        self.settings = self.store.settings()
+        self.runtime = Runtime(self.store)
+        self.cached_ip = "127.0.0.1"
         T.set_mode(self.settings.get("theme", "system"))
         self.root = tk.Tk(className="landrop")      # X11 WM_CLASS = ("landrop", "Landrop")，与 .desktop 的 StartupWMClass 对应
+        W._IMG_CACHE.clear()
         T.init_tk(self.root)
         self.root.title("LAN Drop")
         self.root.configure(bg=T.c["bg"])
@@ -132,9 +103,8 @@ class LauncherApp:
         self.busy: dict[str, bool] = {}
         self.bridge = panels.UiBridge(self.root)
         self.toast = W.Toast(self.root)
-        self.service = None
 
-        side = W.frame(self.root, bg="sidebar", width=T.px(224))
+        side = W.frame(self.root, bg="sidebar", width=T.px(192))
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
         W.frame(self.root, bg="line", width=max(1, T.px(1))).pack(side="left", fill="y")
@@ -149,13 +119,11 @@ class LauncherApp:
         bt = W.frame(brand, bg="sidebar")
         bt.pack(side="left", padx=(T.px(10), 0))
         W.label(bt, "LAN Drop", size=12, weight="bold", bg="sidebar").pack(anchor="w")
-        W.label(bt, "局域网文件互传", role="muted", size=9, bg="sidebar").pack(anchor="w")
 
         nav = W.frame(side, bg="sidebar")
         nav.pack(fill="x", padx=T.px(12))
         self.nav = {}
-        for key, icon, text in (("send", "send", "发送"), ("receive", "download", "接收"),
-                                ("service", "server", "收集服务")):
+        for key, icon, text in (("share", "send", "分享"), ("receive", "download", "接收")):
             item = NavItem(nav, icon, text, lambda k=key: self.select(k))
             item.pack(fill="x", pady=T.px(2))
             self.nav[key] = item
@@ -166,26 +134,34 @@ class LauncherApp:
         W.label(bottom, f"v{__version__}", role="muted", size=8, bg="sidebar").pack(
             anchor="w", padx=T.px(12), pady=(T.px(8), 0))
 
-        self.send = panels.SendPage(self.content, self)
+        self.share = panels.SharePage(self.content, self)
         self.receive = panels.ReceivePage(self.content, self)
-        self.service = panels.ServicePage(self.content, self)
         self.settings_page = panels.SettingsPage(self.content, self)
-        self.pages = {"send": self.send, "receive": self.receive, "service": self.service,
-                      "settings": self.settings_page}
+        self.pages = {"share": self.share, "receive": self.receive, "settings": self.settings_page}
         self.current = None
-
-        self._stdout = sys.stdout
-        sys.stdout = LogTee(self._stdout, lambda t: self.bridge.call(self.service.append_log, t))
 
         for i, key in enumerate(self.PAGES, 1):
             self.root.bind_all(f"<Control-Key-{i}>", lambda e, k=key: self.select(k))
             if sys.platform == "darwin":
                 self.root.bind_all(f"<Command-Key-{i}>", lambda e, k=key: self.select(k))
-        self.root.bind_all("<Control-o>", lambda e: (self.select("send"), self.send.add_files()))
+        self.root.bind_all("<Control-o>", lambda e: (self.select("share"), self.share.add_files()))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.select("send")
+        self.select("share")
         style_titlebar(self.root, T.mode == "dark")
         self._enable_drop()
+        def detect_address():
+            ip = lan_addresses()[0]
+            self.bridge.call(self._set_address, ip)
+        threading.Thread(target=detect_address, daemon=True).start()
+
+    def _set_address(self, ip):
+        self.cached_ip = ip
+        self.share.render_service()
+
+    def copy(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.toast.show("已复制")
 
     # ------------------------------------------------------------ 外观
     def _set_icon(self):
@@ -235,8 +211,8 @@ class LauncherApp:
         self.busy[name] = busy
 
     def set_service_state(self, on):
-        if "service" in getattr(self, "nav", {}):
-            self.nav["service"].set(dot=on)
+        if "share" in getattr(self, "nav", {}):
+            self.nav["share"].set(dot=on)
 
     def notify(self, title, message):
         """后台完成时提醒：窗口不在前台就响一声并在任务栏闪烁（Windows）。"""
@@ -252,21 +228,7 @@ class LauncherApp:
             pass
 
     def save_settings(self):
-        s = dict(self.settings)
-        s.update(theme=T.pref, send_mode=self.send.mode.get(), timeout=self.send.timeout.get(),
-                 receivers=self.send.receivers.get(), expire=self.send.expire.get(),
-                 max_downloads=self.send.max_dl.get(), recv_dir=self.receive.dir.get(),
-                 overwrite=bool(self.receive.overwrite.get()))
-        url = self.send.url.get().strip()
-        if url and not (self.service.running and self.service.info and url == self.service.info["local_url"]):
-            s["server_url"] = url
-        if not os.environ.get("LANDROP_PORT"):
-            s.update(port=self.service.port.get(), scope=self.service.scope.get(),
-                     share_dir=self.service.share_dir.get(), service_address=self.service.address.get())
-        if not os.environ.get("LANDROP_DATA_DIR"):
-            s["data_dir"] = self.service.data_dir.get()
-        self.settings = s
-        system.save_settings(s)
+        self.settings = self.store.configure(theme=T.pref)
 
     # ------------------------------------------------------------ 拖放（Windows）
     def _enable_drop(self):
@@ -275,52 +237,32 @@ class LauncherApp:
         try:
             from . import windrop
             windrop.enable(self.root, lambda paths: self.bridge.call(self._dropped, paths))
-            self.send.drop_hint.configure(text="把文件或文件夹拖进窗口，或点下面的按钮选择")
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 
     def _dropped(self, paths):
-        self.select("send")
-        if self.send.busy:
-            self.toast.show("正在发送，完成后再添加", "info")
+        self.select("share")
+        if self.share.busy:
+            self.toast.show("处理中，请稍候", "info")
             return
-        self.send.reset()
-        self.send.add_paths(paths)
+        self.share.add_paths(paths)
         self.toast.show(f"已添加 {len(paths)} 项")
-
-    # ------------------------------------------------------------ 兼容：自检与旧调用
-    @property
-    def running(self):
-        return self.service.running
-
-    @property
-    def info(self):
-        return self.service.info
-
-    def start(self):
-        self.service.start()
-
-    def stop(self):
-        self.service.stop()
 
     # ------------------------------------------------------------ 退出
     def on_close(self):
         from tkinter import messagebox
         jobs = [n for n, b in self.busy.items() if b]
-        if self.service.running:
-            jobs.append("service")
-        if jobs:
-            what = {"send": "正在发送", "receive": "正在接收", "service": "收集服务正在运行"}
-            text = "、".join(what[j] for j in jobs)
-            if not messagebox.askokcancel("退出 LAN Drop", f"{text}，退出会中断。\n"
-                                          "已上传的文件与链接都会保留。确定退出？", parent=self.root):
+        if jobs or self.runtime.active_transfers:
+            if not messagebox.askokcancel("退出 LAN Drop", "仍有任务正在进行，退出会中断服务。完整文件保留。", parent=self.root):
                 return
         self.save_settings()
-        self.send.shutdown()
         self.receive.shutdown()
-        if self.service.running:
-            self.service.stop()
-        sys.stdout = self._stdout
+        self.runtime.stop()
+        self.runtime.close()
+        self.share.shutdown()
+        self.toast.hide()
+        self.bridge.close()
+        self.store.close()
         self.root.destroy()
 
     def run(self):
@@ -345,13 +287,13 @@ def smoke_test(app) -> int:
     app.root.update()
     app.apply_theme("light")
     app.root.update()
-    app.start()
-    if not app.running:
+    app.runtime.start(0, "127.0.0.1")
+    if not app.runtime.running:
         return 1
-    with urllib.request.urlopen(app.info["local_url"] + "/", timeout=10) as r:
+    with urllib.request.urlopen(app.runtime.info["local_url"] + "/", timeout=10) as r:
         ok = r.status == 200 and b"LAN Drop" in r.read()
     app.root.update()
-    app.stop()
+    app.runtime.stop()
     app.root.update()
     return 0 if ok else 1
 
@@ -366,10 +308,8 @@ def main(argv=None):
         return 2
     import argparse
     ap = argparse.ArgumentParser(prog="landrop gui", description="LAN Drop 桌面窗口")
-    ap.add_argument("--autostart", action="store_true",
-                    help="打开窗口后立即启动收集服务（适合开机自启）")
     ap.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
-    args, _unknown = ap.parse_known_args(argv)     # macOS 从 Finder 启动可能带 -psn_… 参数
+    args = ap.parse_args([arg for arg in (sys.argv[1:] if argv is None else argv) if not arg.startswith("-psn_")])
 
     app = LauncherApp()
     if args.smoke_test:
@@ -379,10 +319,12 @@ def main(argv=None):
             traceback.print_exc()
             return 1
         finally:
-            sys.stdout = app._stdout
+            app.runtime.close()
+            app.share.shutdown()
+            app.toast.hide()
+            app.bridge.close()
+            app.store.close()
             app.root.destroy()
-    if args.autostart:
-        app.root.after(300, lambda: (app.select("service"), app.start()))
     app.run()
     return 0
 

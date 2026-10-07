@@ -1,60 +1,35 @@
-# LAN Drop —— docker compose 常态化运行 + 沙盒加固
-#
-# 用法:
-#   cp .env.example .env             # 至少改一下 LANDROP_ADMIN_KEY，并把 PUID/PGID 设成 id -u / id -g
-#   chown -R $(id -u):$(id -g) data  # 数据目录属主须与容器身份一致
-#   docker compose up -d --build
-#   docker compose logs | grep -E "访问地址|管理员密钥"
-#
-# 数据: 状态库、文件、分块、回收站都在 ./data 里，整卷挂载才能保住链接与摘要记录。
-# 升级自 v1（只有 uploads/）: 先导入再删除旧目录
-#   docker compose run --rm landrop --import /data/uploads --import-recursive
-
 services:
   landrop:
     build: .
     image: landrop:latest
     container_name: landrop
-    restart: unless-stopped
-
+    restart: "no"
+    command: ["--port", "${LANDROP_PORT:-8000}", "--ip", "${LANDROP_IP:-}", "--collect-dir", "/data/collected"]
     ports:
-      # 只监听端口即可；如需限制仅某网段可访问，可改为 "192.168.1.0/24:8000:8000"
-      - "${LANDROP_PORT:-8000}:8000"
-
+      - "${LANDROP_PORT:-8000}:${LANDROP_PORT:-8000}"
     environment:
-      # 首次启动使用的管理员密钥（留空则随机生成并写入数据目录 admin-key.txt）
-      LANDROP_ADMIN_KEY: "${LANDROP_ADMIN_KEY:-}"
-      # 对外访问地址：容器内看到的网卡地址是 Docker 内网地址，
-      # 设为宿主机局域网地址，分享链接才能被同一局域网的其他设备打开
-      LANDROP_PUBLIC_URL: "${LANDROP_PUBLIC_URL:-}"
-      TZ: "${TZ:-Asia/Shanghai}"
-
+      LANDROP_DATA_DIR: /data
+      LANDROP_PORT: "${LANDROP_PORT:-8000}"
+      TZ: "${TZ:-Asia/Singapore}"
     volumes:
-      # 整个数据目录：state.sqlite3 / files / partial / trash 都在这里
       - ${LANDROP_DATA_DIR:-./data}:/data
-      # v1 旧版共享目录（仅在需要导入历史文件时取消注释）
-      # - ./uploads:/data/uploads:ro
-
-    # ------------------------- 沙盒安全加固 ------------------------- #
-    read_only: true                  # 根文件系统只读
+    read_only: true
     tmpfs:
-      - /tmp:size=64m,noexec,nosuid,nodev   # 仅 /tmp 可写，且不可执行
+      - /tmp:size=64m,noexec,nosuid,nodev
     security_opt:
-      - no-new-privileges:true       # 禁止提权（setuid 等）
+      - no-new-privileges:true
     cap_drop:
-      - ALL                          # 丢弃全部 Linux capabilities
+      - ALL
     user: "${PUID:-1000}:${PGID:-1000}"
     ipc: private
     mem_limit: 512m
     pids_limit: 256
-
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/',timeout=3)"]
+      test: ["CMD", "python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ['LANDROP_PORT']+'/',timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 5s
-
     logging:
       driver: json-file
       options:

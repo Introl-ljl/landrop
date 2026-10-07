@@ -1,21 +1,8 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""LAN Drop 持久状态层（SQLite）。
-
-长期状态统一放在数据根目录 ``<data-dir>/``：
-
-* ``state.sqlite3`` —— 空间、授权、访客、会话、文件索引、分块上传状态
-* ``files/<空间>/`` —— 已完成文件的落盘位置（空间根目录可另行指定）
-* ``partial/``       —— 上传中的分块，不属于任何共享目录可见范围
-* ``trash/``         —— 删除的文件移到这里，便于人工恢复
-
-授权判定只依据数据库记录，绝不采信客户端提交的用户名、文件名或 owner 字段。
-访客身份是"浏览器匿名主体"：secret 只下发到 HttpOnly Cookie，库中仅存摘要。
-"""
-
+"""One local SQLite model for shares, received content and desktop/CLI settings."""
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -24,846 +11,645 @@ import shutil
 import sqlite3
 import threading
 import time
-import unicodedata
+from contextlib import contextmanager
 
-from landrop.common import merge_ranges
+from landrop.common import (Cancelled, CliError, default_download_dir, file_version, safe_local_name,
+                            safe_relpath, unique_path)
 
-PBKDF2_ROUNDS = 120_000            # 人类口令的派生轮数
-SESSION_TTL = 7 * 86400            # 会话有效期（秒）
-VISITOR_TTL = 400 * 86400          # 访客 Cookie 有效期（秒）
-VALID_PERMS = ("upload", "read", "delete_own", "full")
-VALID_MODES = ("token", "password")
-HASH_CHUNK = 1024 * 1024
+TEXT_LIMIT = 10 * 1024 * 1024
+TEXT_COUNT = 100
+PARTIAL_TTL = 86400
+SESSION_TTL = 7 * 86400
+_UNSET = object()
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS spaces (
-  id         TEXT PRIMARY KEY,
-  name       TEXT NOT NULL,
-  dir        TEXT NOT NULL UNIQUE,
-  root       TEXT,
-  created_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS grants (
-  id           TEXT PRIMARY KEY,
-  kind         TEXT NOT NULL,
-  space_id     TEXT REFERENCES spaces(id) ON DELETE CASCADE,
-  label        TEXT NOT NULL DEFAULT '',
-  perm         TEXT NOT NULL DEFAULT 'full',
-  mode         TEXT NOT NULL DEFAULT 'token',
-  secret_salt  TEXT,
-  secret_hash  TEXT,
-  token_hash   TEXT,
-  created_at   REAL NOT NULL,
-  expires_at   REAL,
-  revoked      INTEGER NOT NULL DEFAULT 0,
-  version      INTEGER NOT NULL DEFAULT 1,
-  last_used_at REAL
-);
-CREATE INDEX IF NOT EXISTS idx_grants_token ON grants(token_hash);
-CREATE INDEX IF NOT EXISTS idx_grants_space ON grants(space_id);
-CREATE TABLE IF NOT EXISTS visitors (
-  id           TEXT PRIMARY KEY,
-  secret_hash  TEXT NOT NULL,
-  created_at   REAL NOT NULL,
-  last_seen_at REAL NOT NULL,
-  revoked      INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS sessions (
-  token_hash    TEXT PRIMARY KEY,
-  visitor_id    TEXT NOT NULL REFERENCES visitors(id) ON DELETE CASCADE,
-  grant_id      TEXT NOT NULL REFERENCES grants(id) ON DELETE CASCADE,
-  grant_version INTEGER NOT NULL,
-  created_at    REAL NOT NULL,
-  expires_at    REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS files (
-  id            TEXT PRIMARY KEY,
-  space_id      TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
-  stored_name   TEXT NOT NULL,
-  display_name  TEXT NOT NULL,
-  size          INTEGER NOT NULL DEFAULT 0,
-  sha256        TEXT,
-  origin        TEXT NOT NULL DEFAULT 'upload',
-  status        TEXT NOT NULL DEFAULT 'active',
-  owner_visitor TEXT,
-  owner_grant   TEXT,
-  created_at    REAL NOT NULL,
-  deleted_at    REAL,
-  deleted_by    TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_files_space ON files(space_id, status);
-CREATE TABLE IF NOT EXISTS uploads (
-  id            TEXT PRIMARY KEY,
-  space_id      TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
-  visitor_id    TEXT NOT NULL,
-  grant_id      TEXT NOT NULL,
-  display_name  TEXT NOT NULL,
-  total         INTEGER,
-  received      INTEGER NOT NULL DEFAULT 0,
-  created_at    REAL NOT NULL,
-  updated_at    REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS fetch_ranges (
-  grant_id   TEXT NOT NULL REFERENCES grants(id) ON DELETE CASCADE,
-  visitor_id TEXT NOT NULL REFERENCES visitors(id) ON DELETE CASCADE,
-  file_id    TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-  ranges     TEXT NOT NULL,
-  PRIMARY KEY (grant_id, visitor_id, file_id)
-);
-CREATE TABLE IF NOT EXISTS upload_receipts (
-  id         TEXT PRIMARY KEY,
-  space_id   TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
-  visitor_id TEXT NOT NULL,
-  grant_id   TEXT NOT NULL,
-  file_id    TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-  receipt    TEXT NOT NULL,
-  created_at REAL NOT NULL
-);
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS codes(code TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS shares(
+ id TEXT PRIMARY KEY, label TEXT NOT NULL, code TEXT NOT NULL UNIQUE,
+ roots TEXT NOT NULL, enabled INTEGER NOT NULL, allow_upload INTEGER NOT NULL,
+ public_received INTEGER NOT NULL, collection_base TEXT NOT NULL, collection_dir TEXT NOT NULL,
+ expires_at REAL, version INTEGER NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(
+ token TEXT PRIMARY KEY, share_id TEXT NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+ version INTEGER NOT NULL, visitor TEXT NOT NULL, expires_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS uploads(
+ id TEXT PRIMARY KEY, share_id TEXT NOT NULL, visitor TEXT NOT NULL, name TEXT NOT NULL,
+ total INTEGER NOT NULL, received INTEGER NOT NULL, expected TEXT NOT NULL, directory TEXT NOT NULL,
+ target TEXT NOT NULL DEFAULT '', digest TEXT NOT NULL DEFAULT '',
+ complete INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL,
+ target_key TEXT NOT NULL DEFAULT '', cancelled INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS texts(
+ id TEXT PRIMARY KEY, share_id TEXT NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+ received INTEGER NOT NULL, content TEXT NOT NULL, created_at REAL NOT NULL, size INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS digests(path TEXT PRIMARY KEY, version TEXT NOT NULL, digest TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS uploads_share ON uploads(share_id, complete);
+CREATE INDEX IF NOT EXISTS uploads_target ON uploads(target, complete);
+CREATE INDEX IF NOT EXISTS texts_share ON texts(share_id, created_at);
 """
 
 
-def now() -> float:
-    return time.time()
-
-
-def sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def token_hash(token: str) -> str:
-    """高熵密钥只做一次 SHA-256，无需慢派生。"""
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def password_hash(password: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt.encode("utf-8"), PBKDF2_ROUNDS
-    ).hex()
-
-
-def slugify(name: str) -> str:
-    """生成安全的目录名（空间内部标识）。"""
-    name = unicodedata.normalize("NFKD", name or "")
-    name = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower()
-    return (name or "space")[:40]
-
-
-# Windows 保留设备名：这些名字作为文件名会在 Windows 上出错
-_RESERVED_NAMES = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
-}
-
-
-def safe_stored_name(name: str) -> str:
-    """落盘文件名：去掉路径与控制字符，保留可读性；跨平台可写。"""
-    name = (name or "").replace("\\", "/").split("/")[-1]
-    name = unicodedata.normalize("NFC", name)
-    name = "".join(ch for ch in name if ch >= " " and ch != "\x7f")
-    name = name.strip().strip(".")
-    name = re.sub(r'[<>:"/\\|?*]', "_", name)
-    if not name:
-        name = "unnamed"
-    if name.split(".")[0].upper() in _RESERVED_NAMES:
-        name = "_" + name
-    if len(name.encode("utf-8")) > 200:
-        stem, dot, ext = name.rpartition(".")
-        ext = ("." + ext) if dot else ""
-        keep = 220 - len(ext.encode("utf-8"))
-        name = stem.encode("utf-8")[: max(keep, 1)].decode("utf-8", "ignore") + ext
-    return name
-
-
-def safe_rel_name(rel: str) -> str:
-    """文件夹里的相对路径（如 ``相册/2024/a.jpg``）：逐段清洗后用 / 连接，作为显示名。
-    磁盘上仍按清洗后的文件名平铺存放，相对路径只用于展示和接收端还原目录结构。
-    含 ``..`` 或清洗后为空时抛 ValueError。"""
-    parts = [p for p in (rel or "").replace("\\", "/").split("/") if p not in ("", ".")]
-    if not parts or any(p == ".." for p in parts) or len(parts) > 32:
-        raise ValueError("bad path")
-    return "/".join(safe_stored_name(p) for p in parts)
-
-
-def file_sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(HASH_CHUNK)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+class OverlapError(CliError):
+    pass
 
 
 class Store:
-    """SQLite 状态存储。所有方法都可从多线程调用（连接按线程隔离）。"""
-
-    def __init__(self, data_dir: str):
-        self.data_dir = os.path.abspath(data_dir)
-        self.files_root = os.path.join(self.data_dir, "files")
+    def __init__(self, data_dir):
+        self.data_dir = os.path.realpath(os.path.expanduser(data_dir))
+        os.makedirs(self.data_dir, mode=0o700, exist_ok=True)
+        self.db_path = os.path.join(self.data_dir, "shares.sqlite3")
         self.partial_dir = os.path.join(self.data_dir, "partial")
-        self.trash_dir = os.path.join(self.data_dir, "trash")
-        self.export_dir = os.path.join(self.data_dir, "exports")
-        for d in (self.data_dir, self.files_root, self.partial_dir, self.trash_dir, self.export_dir):
-            os.makedirs(d, exist_ok=True)
-        self.db_path = os.path.join(self.data_dir, "state.sqlite3")
+        os.makedirs(self.partial_dir, mode=0o700, exist_ok=True)
         self._local = threading.local()
-        self._write_lock = threading.RLock()
-        with self._conn() as c:
-            c.executescript(_SCHEMA)
-            self._migrate(c)
+        self._lock = threading.RLock()
+        self._publishing = set()
+        fresh = not os.path.exists(self.db_path)
+        if fresh:
+            self._backup_legacy()
+        self.db.executescript(SCHEMA)
+        self._migrate()
+        try:
+            os.chmod(self.db_path, 0o600)
+        except OSError:
+            pass
+        if fresh:
+            self._import_preferences()
 
-    @staticmethod
-    def _migrate(c):
-        """只增不改的迁移：旧数据目录原样可用（新增列带默认值）。"""
-        def cols(table):
-            return {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
-        if "transient" not in cols("spaces"):
-            c.execute("ALTER TABLE spaces ADD COLUMN transient INTEGER NOT NULL DEFAULT 0")
-        grant_cols = cols("grants")
-        if "max_downloads" not in grant_cols:
-            c.execute("ALTER TABLE grants ADD COLUMN max_downloads INTEGER")
-        if "downloads" not in grant_cols:
-            c.execute("ALTER TABLE grants ADD COLUMN downloads INTEGER NOT NULL DEFAULT 0")
+    def _migrate(self):
+        for table, additions in (("uploads", {"target_key": "TEXT NOT NULL DEFAULT ''",
+                                                "cancelled": "INTEGER NOT NULL DEFAULT 0"}),
+                                  ("texts", {"size": "INTEGER NOT NULL DEFAULT 0"})):
+            columns = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
+            for name, definition in additions.items():
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                    if name == "size":
+                        self.db.execute("UPDATE texts SET size=length(CAST(content AS BLOB))")
 
-    # ---------------------------------------------------------------- 连接
-    def _conn(self) -> sqlite3.Connection:
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
+    @property
+    def db(self):
+        if not getattr(self._local, "db", None):
             conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            self._local.conn = conn
-        return conn
+            self._local.db = conn
+        return self._local.db
 
     def close(self):
-        conn = getattr(self._local, "conn", None)
-        if conn is not None:
-            conn.close()
-            self._local.conn = None
+        if getattr(self._local, "db", None):
+            self._local.db.close()
+            self._local.db = None
 
-    def _write(self, sql: str, args=()) -> sqlite3.Cursor:
-        with self._write_lock:
-            cur = self._conn().execute(sql, args)
-            return cur
-
-    def _query(self, sql: str, args=()):
-        return self._conn().execute(sql, args).fetchall()
-
-    def _one(self, sql: str, args=()):
-        return self._conn().execute(sql, args).fetchone()
-
-    # ---------------------------------------------------------------- meta
-    def get_meta(self, key: str):
-        row = self._one("SELECT value FROM meta WHERE key=?", (key,))
-        return row["value"] if row else None
-
-    def set_meta(self, key: str, value: str):
-        self._write(
-            "INSERT INTO meta(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-
-    # ---------------------------------------------------------------- 空间
-    def list_spaces(self, include_transient: bool = False):
-        """默认不含「传输」产生的临时空间，管理面板与空间列表里看不到它们。"""
-        if include_transient:
-            return self._query("SELECT * FROM spaces ORDER BY created_at")
-        return self._query("SELECT * FROM spaces WHERE transient=0 ORDER BY created_at")
-
-    def get_space(self, space_id: str):
-        return self._one("SELECT * FROM spaces WHERE id=?", (space_id,))
-
-    def space_dir(self, space_id: str) -> str:
-        row = self.get_space(space_id)
-        if not row:
-            raise KeyError(space_id)
-        root = row["root"] or self.files_root
-        return os.path.join(root, row["dir"])
-
-    def create_space(self, name: str, root: str | None = None):
-        sid = "sp_" + secrets.token_hex(6)
-        base = slugify(name)
-        with self._write_lock:
-            taken = {r["dir"] for r in self._query("SELECT dir FROM spaces")}
-            slug = base
-            i = 2
-            while slug in taken:
-                slug = f"{base}-{i}"
-                i += 1
-            self._write(
-                "INSERT INTO spaces(id,name,dir,root,created_at) VALUES(?,?,?,?,?)",
-                (sid, name or slug, slug, os.path.abspath(root) if root else None, now()),
-            )
-        os.makedirs(self.space_dir(sid), exist_ok=True)
-        return sid
-
-    # ---------------------------------------------------------------- 授权
-    def create_grant(
-        self,
-        kind: str,
-        space_id: str | None = None,
-        perm: str = "full",
-        mode: str = "token",
-        label: str = "",
-        password: str | None = None,
-        token: str | None = None,
-        expires_at: float | None = None,
-    ):
-        """返回 (grant_row, 明文 secret)。明文只在创建时返回一次。"""
-        if kind not in ("admin", "share"):
-            raise ValueError("kind")
-        if perm not in VALID_PERMS:
-            raise ValueError("perm")
-        if mode not in VALID_MODES:
-            raise ValueError("mode")
-        gid = ("gk_" if kind == "admin" else "gs_") + secrets.token_hex(6)
-        secret = None
-        salt = hashv = None
-        thash = None
-        if mode == "password":
-            secret = password or secrets.token_urlsafe(9)
-            salt = secrets.token_hex(16)
-            hashv = password_hash(secret, salt)
-        else:
-            secret = token or secrets.token_urlsafe(24)
-            thash = token_hash(secret)
-        self._write(
-            "INSERT INTO grants(id,kind,space_id,label,perm,mode,secret_salt,secret_hash,"
-            "token_hash,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (gid, kind, space_id, label, perm, mode, salt, hashv, thash, now(), expires_at),
-        )
-        return self.get_grant(gid), secret
-
-    # ---------------------------------------------------------------- 传输（一次性分享批次）
-    def create_transfer(self, label: str = "", expires_at: float | None = None,
-                        max_downloads: int | None = 1):
-        """临时空间 + 只读授权：到期/用完/撤销后由 cleanup_transfers 连文件一起清理。
-        返回 (grant_row, 明文令牌, space_id)。"""
-        sid = self.create_space("transfer-" + secrets.token_hex(3))
-        # 目录名保持 transfer-xxxx；显示名用备注（浏览器打开文件码时看到的是「报告.pdf, 相册」而不是内部名）
-        self._write("UPDATE spaces SET transient=1, name=? WHERE id=?", ((label or "一次性传输")[:60], sid))
-        row, secret = self.create_grant(kind="share", space_id=sid, perm="read", mode="token",
-                                        label=label, expires_at=expires_at)
-        if max_downloads:
-            self._write("UPDATE grants SET max_downloads=? WHERE id=?", (int(max_downloads), row["id"]))
-        return self.get_grant(row["id"]), secret, sid
-
-    def record_download(self, grant_id: str) -> bool:
-        """登记一次「完整取件」；返回是否已用完次数。"""
-        with self._write_lock:
-            self._write("UPDATE grants SET downloads=downloads+1 WHERE id=?", (grant_id,))
-            g = self.get_grant(grant_id)
-        return bool(g and g["max_downloads"] is not None and g["downloads"] >= g["max_downloads"])
-
-    def record_fetch_range(self, grant_id: str, visitor_id: str, file_id: str,
-                           start: int, stop: int) -> bool:
-        """Count a pickup only when one visitor has covered every file in the batch."""
-        with self._write_lock, self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            file = self.get_file(file_id)
-            if file is None or not self.grant_state(grant_id)[0]:
-                return False
-            start, stop = max(0, start), min(stop, file["size"])
-            if stop <= start and file["size"]:
-                return False
-            previous = self._one(
-                "SELECT ranges FROM fetch_ranges WHERE grant_id=? AND visitor_id=? AND file_id=?",
-                (grant_id, visitor_id, file_id))
-            ranges = merge_ranges(json.loads(previous["ranges"]) if previous else [], start, stop)
-            self._write(
-                "INSERT INTO fetch_ranges(grant_id,visitor_id,file_id,ranges) VALUES(?,?,?,?) "
-                "ON CONFLICT(grant_id,visitor_id,file_id) DO UPDATE SET ranges=excluded.ranges",
-                (grant_id, visitor_id, file_id, json.dumps(ranges)),
-            )
-            files = self._query(
-                "SELECT f.size, fp.ranges FROM files f LEFT JOIN fetch_ranges fp ON "
-                "fp.file_id=f.id AND fp.grant_id=? AND fp.visitor_id=? "
-                "WHERE f.status='active' AND f.space_id=(SELECT space_id FROM grants WHERE id=?)",
-                (grant_id, visitor_id, grant_id))
-            if not files or any(r["ranges"] is None or
-                                json.loads(r["ranges"]) != ([[0, r["size"]]] if r["size"] else [])
-                                for r in files):
-                return False
-            self._write("DELETE FROM fetch_ranges WHERE grant_id=? AND visitor_id=?",
-                        (grant_id, visitor_id))
-            return self.record_download(grant_id)
-
-    def get_fetch_ranges(self, grant_id: str, visitor_id: str, file_id: str):
-        row = self._one("SELECT ranges FROM fetch_ranges WHERE grant_id=? AND visitor_id=? AND file_id=?",
-                        (grant_id, visitor_id, file_id))
-        return json.loads(row["ranges"]) if row else []
-
-    def fetched_files(self, grant_id: str, visitor_id: str):
-        rows = self._query(
-            "SELECT fp.file_id, fp.ranges, f.size FROM fetch_ranges fp "
-            "JOIN files f ON f.id=fp.file_id WHERE fp.grant_id=? AND fp.visitor_id=?",
-            (grant_id, visitor_id))
-        return {r["file_id"] for r in rows
-                if json.loads(r["ranges"]) == ([[0, r["size"]]] if r["size"] else [])}
-
-    def list_transfers(self):
-        rows = self._query(
-            "SELECT g.*, s.id AS sid FROM grants g JOIN spaces s ON s.id=g.space_id "
-            "WHERE s.transient=1 ORDER BY g.created_at DESC")
-        out = []
-        for g in rows:
-            files = self._query(
-                "SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS b FROM files "
-                "WHERE space_id=? AND status='active'", (g["sid"],))[0]
-            out.append({"id": g["id"], "space_id": g["sid"], "label": g["label"],
-                        "created_at": g["created_at"], "expires_at": g["expires_at"],
-                        "downloads": g["downloads"], "max_downloads": g["max_downloads"],
-                        "revoked": bool(g["revoked"]), "files": files["n"], "bytes": files["b"],
-                        "usable": self.grant_state(g["id"])[0]})
-        return out
-
-    def cleanup_transfers(self) -> int:
-        """删除已失效的传输（过期/撤销/次数用完）及其磁盘文件；返回清理数量。"""
-        removed = 0
-        for g in self._query(
-                "SELECT g.id AS gid, s.id AS sid FROM grants g JOIN spaces s ON s.id=g.space_id "
-                "WHERE s.transient=1"):
-            if self.grant_state(g["gid"])[0]:
-                continue
+    @contextmanager
+    def transaction(self):
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
             try:
-                shutil.rmtree(self.space_dir(g["sid"]), ignore_errors=True)
-            except KeyError:
-                pass
-            self._write("DELETE FROM spaces WHERE id=?", (g["sid"],))   # 级联清理授权/文件/会话/上传
-            removed += 1
-        # 只有空间、没有授权的残留（创建过程中崩溃）
-        for sp in self._query(
-                "SELECT id FROM spaces WHERE transient=1 AND created_at<? AND "
-                "NOT EXISTS (SELECT 1 FROM grants WHERE space_id=spaces.id)", (now() - 3600,)):
-            shutil.rmtree(self.space_dir(sp["id"]), ignore_errors=True)
-            self._write("DELETE FROM spaces WHERE id=?", (sp["id"],))
-            removed += 1
-        return removed
+                yield self.db
+                self.db.execute("COMMIT")
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
 
-    def get_grant(self, grant_id: str):
-        return self._one("SELECT * FROM grants WHERE id=?", (grant_id,))
-
-    def list_grants(self):
-        return self._query(
-            "SELECT g.*, s.name AS space_name FROM grants g "
-            "LEFT JOIN spaces s ON s.id=g.space_id WHERE COALESCE(s.transient,0)=0 "
-            "ORDER BY g.created_at"
-        )
-
-    def find_login_grant(self, secret: str):
-        """按密钥/口令找可登录的授权；返回 grant 行或 None。"""
-        if not secret:
-            return None
-        thash = token_hash(secret)
-        row = self._one("SELECT * FROM grants WHERE mode='token' AND token_hash=?", (thash,))
-        if row:
-            return row
-        for cand in self._query(
-            "SELECT * FROM grants WHERE mode='password' AND secret_hash IS NOT NULL"
-        ):
-            digest = password_hash(secret, cand["secret_salt"])
-            if secrets.compare_digest(digest, cand["secret_hash"]):
-                return cand
-        return None
-
-    def grant_state(self, grant_id: str):
-        """返回 (是否可用, 原因)。撤销/过期时立即拒绝，无需等待会话到期。"""
-        g = self.get_grant(grant_id)
-        if g is None:
-            return False, "授权不存在"
-        if g["revoked"]:
-            return False, "授权已撤销"
-        if g["expires_at"] and g["expires_at"] < now():
-            return False, "授权已过期"
-        if g["max_downloads"] is not None and g["downloads"] >= g["max_downloads"]:
-            return False, "下载次数已用完"
-        return True, ""
-
-    def touch_grant(self, grant_id: str):
-        self._write("UPDATE grants SET last_used_at=? WHERE id=?", (now(), grant_id))
-
-    def revoke_grant(self, grant_id: str) -> bool:
-        cur = self._write("UPDATE grants SET revoked=1, version=version+1 WHERE id=?", (grant_id,))
-        return cur.rowcount > 0
-
-    def rotate_grant(self, grant_id: str):
-        """轮换密钥：旧密钥立即失效，授权 ID 与权限保持不变。"""
-        g = self.get_grant(grant_id)
-        if g is None:
-            return None
-        if g["mode"] == "password":
-            secret = secrets.token_urlsafe(9)
-            salt = secrets.token_hex(16)
-            self._write(
-                "UPDATE grants SET secret_salt=?, secret_hash=?, version=version+1 WHERE id=?",
-                (salt, password_hash(secret, salt), grant_id),
-            )
-        else:
-            secret = secrets.token_urlsafe(24)
-            self._write(
-                "UPDATE grants SET token_hash=?, version=version+1 WHERE id=?",
-                (token_hash(secret), grant_id),
-            )
-        g = self.get_grant(grant_id)
-        if g is not None and g["kind"] == "admin":      # 保持 admin-key.txt 与当前密钥一致
-            self._write_admin_key_file(secret)
-        return secret
-
-    def admin_key_file_stale(self) -> bool:
-        """admin-key.txt 存在但与当前管理员密钥不匹配（例如旧版轮换后没有更新文件）。"""
-        g = self.admin_grant()
+    def _backup_legacy(self):
+        old = os.path.join(self.data_dir, "state.sqlite3")
+        if not os.path.isfile(old):
+            return
+        dest = os.path.join(self.data_dir, "legacy-backup", time.strftime("%Y%m%d-%H%M%S") +
+                            "-" + secrets.token_hex(3))
+        os.makedirs(dest, mode=0o700)
+        source = sqlite3.connect(old)
+        backup = sqlite3.connect(os.path.join(dest, "state.sqlite3"))
         try:
-            with open(self.admin_key_file(), "r", encoding="utf-8") as f:
-                content = f.read().strip()
-        except OSError:
-            return False
-        return bool(g and content and token_hash(content) != (g["token_hash"] or ""))
+            source.backup(backup)
+        finally:
+            backup.close()
+            source.close()
+        for name in ("desktop.json", "admin-key.txt"):
+            path = os.path.join(self.data_dir, name)
+            if os.path.isfile(path):
+                shutil.copy2(path, dest)
 
-    # ---------------------------------------------------------------- 访客
-    def create_visitor(self) -> tuple[str, str]:
-        vid = "v_" + secrets.token_hex(8)
-        secret = secrets.token_urlsafe(32)
-        ts = now()
-        self._write(
-            "INSERT INTO visitors(id,secret_hash,created_at,last_seen_at) VALUES(?,?,?,?)",
-            (vid, token_hash(secret), ts, ts),
-        )
-        return vid, secret
-
-    def visitor_from_secret(self, secret: str):
-        if not secret:
-            return None
-        row = self._one(
-            "SELECT * FROM visitors WHERE secret_hash=? AND revoked=0", (token_hash(secret),)
-        )
-        return row
-
-    def touch_visitor(self, visitor_id: str):
-        self._write("UPDATE visitors SET last_seen_at=? WHERE id=?", (now(), visitor_id))
-
-    # ---------------------------------------------------------------- 会话
-    def create_session(self, visitor_id: str, grant_id: str, grant_version: int):
-        token = secrets.token_urlsafe(32)
-        ts = now()
-        self._write(
-            "INSERT INTO sessions(token_hash,visitor_id,grant_id,grant_version,created_at,expires_at)"
-            " VALUES(?,?,?,?,?,?)",
-            (token_hash(token), visitor_id, grant_id, grant_version, ts, ts + SESSION_TTL),
-        )
-        return token
-
-    def session_from_token(self, token: str):
-        """返回会话及其关联授权；授权被撤销/过期或版本变化时返回 None。"""
-        if not token:
-            return None
-        row = self._one("SELECT * FROM sessions WHERE token_hash=?", (token_hash(token),))
-        if row is None:
-            return None
-        if row["expires_at"] < now():
-            self._write("DELETE FROM sessions WHERE token_hash=?", (row["token_hash"],))
-            return None
-        g = self.get_grant(row["grant_id"])
-        if g is None or not self.grant_state(g["id"])[0]:
-            return None
-        if g["version"] != row["grant_version"]:
-            return None
-        visitor = self._one("SELECT * FROM visitors WHERE id=?", (row["visitor_id"],))
-        if visitor is None or visitor["revoked"]:
-            return None
-        return {
-            "session": row,
-            "grant": g,
-            "visitor": visitor,
-            "space_id": g["space_id"],
-            "perm": g["perm"],
-        }
-
-    def delete_session(self, token: str):
-        self._write("DELETE FROM sessions WHERE token_hash=?", (token_hash(token),))
-
-    def purge_expired(self):
-        ts = now()
-        with self._write_lock:
-            self._write("DELETE FROM sessions WHERE expires_at<?", (ts,))
-            stale = self._query("SELECT id FROM uploads WHERE updated_at<?", (ts - 3 * 86400,))
-            for r in stale:                     # 行删掉之前先把对应的分块文件一并清掉
-                try:
-                    os.remove(self.part_path(r["id"]))
-                except OSError:
-                    pass
-            self._write("DELETE FROM uploads WHERE updated_at<?", (ts - 3 * 86400,))
-            if self._one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fetch_progress'"):
-                self._write("DELETE FROM fetch_progress WHERE grant_id NOT IN (SELECT id FROM grants)")
-            self._write("DELETE FROM upload_receipts WHERE created_at<?", (ts - SESSION_TTL,))
-
-    def purge_orphan_parts(self, min_age: float = 600) -> int:
-        """清理 partial/ 下没有对应上传会话的分块文件（进程中断、传输被清理等留下的孤儿）。
-
-        min_age 秒内的新文件不动，避免与正在创建的上传竞态。"""
+    def _import_preferences(self):
         try:
-            names = os.listdir(self.partial_dir)
-        except OSError:
-            return 0
-        cutoff = now() - min_age
-        removed = 0
-        for fn in names:
-            if not fn.endswith(".part"):
-                continue
-            path = os.path.join(self.partial_dir, fn)
-            try:
-                if os.path.getmtime(path) >= cutoff:
-                    continue
-            except OSError:
-                continue
-            if self._one("SELECT 1 FROM uploads WHERE id=?", (fn[:-len(".part")],)):
-                continue
-            try:
-                os.remove(path)
-                removed += 1
-            except OSError:
-                pass
-        return removed
-
-    # ---------------------------------------------------------------- 文件
-    def list_files(self, space_id: str, owner_visitor: str | None = None):
-        """列出空间内文件；owner_visitor 非空时只列出该访客上传的文件。"""
-        sql = "SELECT * FROM files WHERE space_id=? AND status='active'"
-        args: list = [space_id]
-        if owner_visitor:
-            sql += " AND owner_visitor=?"
-            args.append(owner_visitor)
-        sql += " ORDER BY created_at DESC"
-        return self._query(sql, args)
-
-    def get_file(self, file_id: str):
-        return self._one("SELECT * FROM files WHERE id=?", (file_id,))
-
-    def add_file(self, **kw):
-        fid = kw.get("id") or "f_" + secrets.token_hex(8)
-        self._write(
-            "INSERT INTO files(id,space_id,stored_name,display_name,size,sha256,origin,status,"
-            "owner_visitor,owner_grant,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                fid,
-                kw["space_id"],
-                kw["stored_name"],
-                kw["display_name"],
-                kw.get("size", 0),
-                kw.get("sha256"),
-                kw.get("origin", "upload"),
-                kw.get("status", "active"),
-                kw.get("owner_visitor"),
-                kw.get("owner_grant"),
-                kw.get("created_at", now()),
-            ),
-        )
-        return fid
-
-    def mark_deleted(self, file_id: str, actor: str, status: str = "deleted"):
-        self._write(
-            "UPDATE files SET status=?, deleted_at=?, deleted_by=? WHERE id=?",
-            (status, now(), actor, file_id),
-        )
-
-    def file_path(self, row) -> str:
-        return os.path.join(self.space_dir(row["space_id"]), row["stored_name"])
-
-    def unique_stored_name(self, space_id: str, name: str) -> str:
-        """同名文件追加 (1)、(2)… 序号；已删除文件仍占用名字，避免歧义。"""
-        directory = self.space_dir(space_id)
-        base, ext = os.path.splitext(name)
-        candidate = name
-        i = 1
-        while os.path.exists(os.path.join(directory, candidate)):
-            candidate = f"{base} ({i}){ext}"
-            i += 1
-        return candidate
-
-    def move_to_trash(self, row) -> str | None:
-        """把文件移入 trash/，返回新路径（失败返回 None）。"""
-        src = self.file_path(row)
-        if not os.path.isfile(src):
-            return None
-        dest_dir = os.path.join(self.trash_dir, row["space_id"])
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, row["id"] + "__" + row["stored_name"])
-        try:
-            shutil.move(src, dest)
-        except OSError:
-            try:
-                shutil.copy2(src, dest)
-                os.remove(src)
-            except OSError:
-                return None
-        return dest
-
-    # ---------------------------------------------------------------- 分块
-    def create_upload(self, upload_id: str, space_id: str, visitor_id: str, grant_id: str,
-                      display_name: str, total: int | None):
-        ts = now()
-        self._write(
-            "INSERT INTO uploads(id,space_id,visitor_id,grant_id,display_name,total,received,"
-            "created_at,updated_at) VALUES(?,?,?,?,?,?,0,?,?)",
-            (upload_id, space_id, visitor_id, grant_id, display_name, total, ts, ts),
-        )
-
-    def get_upload(self, upload_id: str):
-        return self._one("SELECT * FROM uploads WHERE id=?", (upload_id,))
-
-    def update_upload(self, upload_id: str, received: int, total: int | None = None):
-        if total is None:
-            self._write(
-                "UPDATE uploads SET received=?, updated_at=? WHERE id=?",
-                (received, now(), upload_id),
-            )
-        else:
-            self._write(
-                "UPDATE uploads SET received=?, total=?, updated_at=? WHERE id=?",
-                (received, total, now(), upload_id),
-            )
-
-    def drop_upload(self, upload_id: str):
-        self._write("DELETE FROM uploads WHERE id=?", (upload_id,))
-
-    def get_upload_receipt(self, upload_id: str):
-        return self._one("SELECT * FROM upload_receipts WHERE id=?", (upload_id,))
-
-    def save_upload_receipt(self, upload, receipt):
-        self._write(
-            "INSERT INTO upload_receipts(id,space_id,visitor_id,grant_id,file_id,receipt,created_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (upload["id"], upload["space_id"], upload["visitor_id"], upload["grant_id"],
-             receipt["id"], json.dumps(receipt), now()))
-
-    def part_path(self, upload_id: str) -> str:
-        return os.path.join(self.partial_dir, upload_id + ".part")
-
-    # ---------------------------------------------------------------- 管理员
-    def admin_grant(self):
-        return self._one("SELECT * FROM grants WHERE kind='admin' ORDER BY created_at LIMIT 1")
-
-    def admin_key_file(self) -> str:
-        return os.path.join(self.data_dir, "admin-key.txt")
-
-    def init_admin(self, provided: str | None = None) -> tuple[str | None, bool]:
-        """确保存在管理员密钥；返回 (明文密钥或 None, 是否新建/轮换)。
-
-        明文只在生成或显式重置时返回，并写入 ``admin-key.txt``（0600）便于找回。
-        """
-        g = self.admin_grant()
-        if g is None:
-            secret = provided or secrets.token_urlsafe(18)
-            self.create_grant(kind="admin", space_id=None, perm="full", mode="token",
-                              label="管理员", token=secret)
-            self._write_admin_key_file(secret if not provided else secret)
-            return secret, True
-        if provided:
-            if secrets.compare_digest(token_hash(provided), g["token_hash"] or ""):
-                return provided, False
-            self._write(
-                "UPDATE grants SET token_hash=?, version=version+1 WHERE id=?",
-                (token_hash(provided), g["id"]),
-            )
-            self._write_admin_key_file(provided)
-            return provided, True
-        try:
-            with open(self.admin_key_file(), "r", encoding="utf-8") as f:
-                return f.read().strip() or None, False
-        except OSError:
-            return None, False
-
-    def _write_admin_key_file(self, secret: str):
-        path = self.admin_key_file()
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(secret + "\n")
-            os.chmod(path, 0o600)
-        except OSError:
+            with open(os.path.join(self.data_dir, "desktop.json"), encoding="utf-8") as stream:
+                old = json.load(stream)
+            values = {key: old[key] for key in ("theme", "recv_dir") if key in old}
+            if str(old.get("port", "")).isdigit() and 1 <= int(old["port"]) <= 65535:
+                values["port"] = int(old["port"])
+            self.configure(**values)
+        except (OSError, ValueError, TypeError, CliError):
             pass
 
-    # ---------------------------------------------------------------- 导入
-    def import_directory(self, space_id: str, src_dir: str, recursive: bool = False) -> dict:
-        """把已有目录里的文件复制并登记进空间；原目录保持不变。
+    def get_meta(self, key, default=None):
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
 
-        每个文件都做"复制 → 校验 SHA-256 → 登记"，任何异常都会记录到报告中，
-        不会删除源文件，也不会覆盖已登记的文件。
-        """
-        report = {"imported": [], "skipped": [], "failed": [], "manifest": None}
-        src_root = os.path.abspath(src_dir)
-        if not os.path.isdir(src_root):
-            report["failed"].append({"path": src_root, "error": "目录不存在"})
-            return report
-        entries = []
-        if recursive:
-            for base, _dirs, names in os.walk(src_root):
-                for nm in sorted(names):
-                    entries.append(os.path.join(base, nm))
-        else:
-            entries = [os.path.join(src_root, nm) for nm in sorted(os.listdir(src_root))]
-        for path in entries:
-            rel = os.path.relpath(path, src_root)
-            base = os.path.basename(path)
-            if base.startswith("."):
-                # 隐藏文件（.gitkeep、.DS_Store 等）与内部临时文件不导入
-                report["skipped"].append({"path": rel, "reason": "隐藏或内部文件"})
-                continue
-            if not os.path.isfile(path):
-                report["skipped"].append({"path": rel, "reason": "非普通文件"})
-                continue
-            try:
-                src_hash = file_sha256(path)
-                stored = self.unique_stored_name(space_id, safe_stored_name(rel))
-                dest = os.path.join(self.space_dir(space_id), stored)
-                self._copy_verified(path, dest, src_hash)
-                size = os.path.getsize(dest)
-                fid = self.add_file(
-                    space_id=space_id,
-                    stored_name=stored,
-                    display_name=safe_stored_name(rel),
-                    size=size,
-                    sha256=src_hash,
-                    origin="import",
-                    owner_visitor=None,
-                    owner_grant=None,
-                    created_at=os.path.getmtime(path),
-                )
-                report["imported"].append({"file_id": fid, "source": rel,
-                                           "stored": stored, "sha256": src_hash})
-            except Exception as exc:  # noqa: BLE001
-                report["failed"].append({"path": rel, "error": f"{exc!r}"})
-        manifest = os.path.join(self.export_dir, f"import-{int(now())}.json")
+    def set_meta(self, key, value):
+        with self.transaction() as db:
+            db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, json.dumps(value)))
+
+    def settings(self):
+        downloads = default_download_dir()
+        values = {"collect_dir": os.path.join(downloads, "LANDrop"), "recv_dir": downloads,
+                  "port": 8000, "ip": "", "theme": "system", "text_preview_mib": 10,
+                  "image_preview_mib": 20, "receive_history": []}
+        values.update(self.get_meta("settings", {}))
+        return values
+
+    def configure(self, **values):
+        if set(values) - set(self.settings()):
+            raise CliError("未知设置")
         try:
-            with open(manifest, "w", encoding="utf-8") as f:
-                json.dump({"space_id": space_id, "source": src_root, "report": report}, f,
-                          ensure_ascii=False, indent=2)
-            report["manifest"] = manifest
-        except OSError:
-            report["manifest"] = None
-        return report
+            for key in ("port", "text_preview_mib", "image_preview_mib"):
+                if key in values:
+                    value = int(values[key])
+                    if not 1 <= value <= (65535 if key == "port" else 1024):
+                        raise ValueError
+                    values[key] = value
+            if values.get("ip"):
+                ipaddress.ip_address(values["ip"])
+        except (TypeError, ValueError):
+            raise CliError("端口、地址或预览上限不正确") from None
+        for key in ("collect_dir", "recv_dir"):
+            if key in values:
+                values[key] = os.path.realpath(os.path.expanduser(values[key]))
+        if "theme" in values and values["theme"] not in ("system", "light", "dark"):
+            raise CliError("未知主题")
+        with self.transaction() as db:
+            row = db.execute("SELECT value FROM meta WHERE key='settings'").fetchone()
+            settings = json.loads(row[0]) if row else {}
+            settings.update(values)
+            db.execute("INSERT OR REPLACE INTO meta VALUES('settings',?)", (json.dumps(settings),))
+        return self.settings()
+
+    def record_receive(self, count, directory):
+        with self.transaction() as db:
+            row = db.execute("SELECT value FROM meta WHERE key='settings'").fetchone()
+            settings = json.loads(row[0]) if row else {}
+            history = settings.get("receive_history", [])
+            settings["receive_history"] = [{"count": count, "directory": directory,
+                                             "time": time.time()}] + history[:4]
+            db.execute("INSERT OR REPLACE INTO meta VALUES('settings',?)", (json.dumps(settings),))
 
     @staticmethod
-    def _copy_verified(src: str, dest: str, expect_hash: str):
-        """复制并校验；校验失败时删除目标文件，避免留下未验证副本。"""
-        tmp = dest + ".importing"
-        with open(src, "rb") as fin, open(tmp, "wb") as fout:
-            shutil.copyfileobj(fin, fout, HASH_CHUNK)
-            fout.flush()
-            os.fsync(fout.fileno())
-        got = file_sha256(tmp)
-        if got != expect_hash:
-            os.remove(tmp)
-            raise ValueError(f"复制结果校验失败（{got[:12]}…）")
-        os.replace(tmp, dest)
+    def _share(row):
+        if row is None:
+            raise CliError("分享不存在")
+        item = dict(row)
+        item["roots"] = json.loads(item["roots"])
+        item["active"] = bool(item["enabled"] and
+                              (not item["expires_at"] or item["expires_at"] > time.time()))
+        return item
 
+    def shares(self):
+        return [self._share(row) for row in self.db.execute("SELECT * FROM shares ORDER BY created_at DESC")]
 
+    def share(self, share_id):
+        return self._share(self.db.execute("SELECT * FROM shares WHERE id=?", (share_id,)).fetchone())
 
+    def _new_code(self, db):
+        for _ in range(1000):
+            code = f"{secrets.randbelow(1000000):06d}"
+            try:
+                db.execute("INSERT INTO codes VALUES(?)", (code,))
+                return code
+            except sqlite3.IntegrityError:
+                pass
+        raise CliError("无法分配未使用的授权码")
 
+    @staticmethod
+    def _contains(parent, child):
+        try:
+            return os.path.commonpath((parent, child)) == parent
+        except ValueError:
+            return False
+
+    def _protected(self, path):
+        if os.path.basename(path).startswith(".landrop-") or path.endswith(".landrop-pending"):
+            return True
+        if any(self._contains(os.path.join(self.data_dir, name), path) for name in
+               ("partial", "receivers", "legacy-backup")):
+            return True
+        return os.path.dirname(path) == self.data_dir and (
+            os.path.basename(path) in ("desktop.json", "admin-key.txt") or
+            any(os.path.basename(path).startswith(name) for name in
+                ("shares.sqlite3", "state.sqlite3", "service.lock", "diagnostics.log")))
+
+    def _roots(self, paths):
+        roots = []
+        for path in paths:
+            path = os.path.realpath(os.path.expanduser(path))
+            if self._protected(path) or (not os.path.isfile(path) and not os.path.isdir(path)):
+                raise CliError(f"文件或目录不可用：{path}")
+            if not any(root["path"] == path for root in roots):
+                roots.append({"path": path, "directory": os.path.isdir(path)})
+        return roots
+
+    def _overlaps(self, shares):
+        return {(source["id"], root["path"], target["id"], target["collection_dir"])
+                for source in shares for root in source["roots"] if root["directory"]
+                for target in shares if target["collection_dir"] and not target["public_received"]
+                if self._contains(root["path"], target["collection_dir"]) or
+                self._contains(target["collection_dir"], root["path"])}
+
+    def save_share(self, share_id=None, paths=None, label=None, allow_upload=None,
+                   public_received=None, collection_base=None, expires_at=_UNSET,
+                   enabled=None, confirm_overlap=False, text=None, expected_version=None):
+        created_dir = ""
+        try:
+            with self.transaction() as db:
+                existing = self.shares()
+                old = self.share(share_id) if share_id else None
+                if old and expected_version is not None and old["version"] != expected_version:
+                    raise CliError("分享已被其他本机操作修改，请刷新后重试", 409)
+                item = dict(old) if old else {
+                    "id": secrets.token_hex(12), "label": "", "roots": [], "enabled": True,
+                    "allow_upload": False, "public_received": False, "collection_base": "",
+                    "collection_dir": "", "expires_at": None, "version": 0, "created_at": time.time()}
+                if paths is not None:
+                    item["roots"] = self._roots(paths)
+                if label is not None:
+                    item["label"] = str(label).strip()[:100]
+                if not item["label"]:
+                    item["label"] = (os.path.basename(item["roots"][0]["path"]) if
+                                     item["roots"] else "收集") or "分享"
+                for key, value in (("allow_upload", allow_upload), ("public_received", public_received),
+                                   ("enabled", enabled)):
+                    if value is not None:
+                        item[key] = bool(value)
+                if old and old["expires_at"] and old["expires_at"] <= time.time() and enabled is None:
+                    item["enabled"] = False
+                base = os.path.realpath(os.path.expanduser(collection_base or
+                                       item["collection_base"] or self.settings()["collect_dir"]))
+                if self._protected(base):
+                    raise CliError("程序私有目录不能用于收集")
+                if (item["allow_upload"] or item["collection_dir"]) and (
+                        not item["collection_dir"] or base != item["collection_base"]):
+                    os.makedirs(base, exist_ok=True)
+                    name = safe_local_name(item["label"]) + "_" + time.strftime("%Y%m%d-%H%M%S")
+                    directory = unique_path(base, name)
+                    os.mkdir(directory)
+                    item["collection_dir"] = created_dir = directory
+                item["collection_base"] = base
+                if expires_at is not _UNSET:
+                    item["expires_at"] = expires_at
+                changed = [s for s in existing if s["id"] != item["id"]] + [item]
+                if not confirm_overlap and self._overlaps(changed) - self._overlaps(existing):
+                    raise OverlapError("共享目录与私密收集目录重叠，目录分享可能公开当前及后续收到的文件，请确认")
+                item["code"] = old["code"] if old else self._new_code(db)
+                item["version"] += 1
+                values = (item["label"], item["code"], json.dumps(item["roots"]),
+                          item["enabled"], item["allow_upload"], item["public_received"], base,
+                          item["collection_dir"], item["expires_at"], item["version"], item["created_at"], item["id"])
+                if old:
+                    db.execute("UPDATE shares SET label=?,code=?,roots=?,enabled=?,allow_upload=?,"
+                               "public_received=?,collection_base=?,collection_dir=?,expires_at=?,"
+                               "version=?,created_at=? WHERE id=?", values)
+                else:
+                    db.execute("INSERT INTO shares VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (item["id"],) + values[:-1])
+                if text is not None:
+                    self._insert_text(db, item["id"], text, False)
+            return self.share(item["id"])
+        except BaseException:
+            if created_dir:
+                try:
+                    os.rmdir(created_dir)
+                except OSError:
+                    pass
+            raise
+
+    def set_enabled(self, share_id, enabled):
+        with self.transaction() as db:
+            item = self.share(share_id)
+            if enabled and item["expires_at"] and item["expires_at"] <= time.time():
+                raise CliError("分享已过期，请先调整有效期")
+            db.execute("UPDATE shares SET enabled=?,version=version+1 WHERE id=?", (bool(enabled), share_id))
+        return self.share(share_id)
+
+    def rotate(self, share_id):
+        with self.transaction() as db:
+            self.share(share_id)
+            db.execute("UPDATE shares SET code=?,version=version+1 WHERE id=?", (self._new_code(db), share_id))
+        return self.share(share_id)
+
+    def delete_share(self, share_id):
+        with self.transaction() as db:
+            self.share(share_id)
+            db.execute("DELETE FROM shares WHERE id=?", (share_id,))
+            db.execute("DELETE FROM uploads WHERE share_id=? AND complete=1", (share_id,))
+
+    @staticmethod
+    def _hash(value):
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def login(self, code, visitor):
+        with self.transaction() as db:
+            row = db.execute("SELECT * FROM shares WHERE code=?", (code,)).fetchone()
+            if not row or not self._share(row)["active"]:
+                raise CliError("授权码无效或分享已停用")
+            token = secrets.token_urlsafe(24)
+            db.execute("INSERT INTO sessions VALUES(?,?,?,?,?)", (
+                self._hash(token), row["id"], row["version"], self._hash(visitor), time.time() + SESSION_TTL))
+        return token
+
+    def auth(self, token):
+        row = self.db.execute("SELECT * FROM sessions WHERE token=? AND expires_at>?",
+                              (self._hash(token), time.time())).fetchone()
+        if row:
+            try:
+                share = self.share(row["share_id"])
+                if share["active"] and share["version"] == row["version"]:
+                    return {"share": share, "visitor": row["visitor"], "version": row["version"],
+                            "session": row["token"]}
+            except CliError:
+                pass
+        return None
+
+    def guard(self, auth, upload=False):
+        item = self.share(auth["share"]["id"])
+        session = self.db.execute("SELECT 1 FROM sessions WHERE token=? AND expires_at>?",
+                                  (auth["session"], time.time())).fetchone()
+        if (not session or not item["active"] or item["version"] != auth["version"] or
+                (upload and not item["allow_upload"])):
+            raise CliError("分享已变化或失去访问权限", 403)
+        return item
+
+    def logout(self, token):
+        with self.transaction() as db:
+            db.execute("DELETE FROM sessions WHERE token=?", (self._hash(token),))
+
+    @staticmethod
+    def file_id(share_id, path):
+        return hashlib.sha256((share_id + "\n" + path).encode()).hexdigest()[:32]
+
+    def files(self, share_id, local=False):
+        share = self.share(share_id)
+        uploads = list(self.db.execute("SELECT * FROM uploads WHERE share_id=? AND complete=1", (share_id,)))
+        result, used, names = [], set(), set()
+        def add(path, name, explicit=False):
+            if path in used or self._protected(path) or os.path.realpath(path) != path or not os.path.isfile(path):
+                return
+            with self._lock:
+                received = self.db.execute("SELECT share_id,complete FROM uploads WHERE target=?", (path,)).fetchone()
+                if received and (not received["complete"] or
+                                 (not local and not explicit and received["share_id"] == share_id and
+                                  not share["public_received"])):
+                    return
+            try:
+                stat = os.stat(path)
+                version = file_version(path)
+            except OSError:
+                return
+            name = "/".join(safe_local_name(part) for part in name.split("/"))
+            if name in names:
+                stem, ext = os.path.splitext(name)
+                n = 1
+                while f"{stem} ({n}){ext}" in names:
+                    n += 1
+                name = f"{stem} ({n}){ext}"
+            names.add(name)
+            used.add(path)
+            digest = self.db.execute("SELECT digest FROM digests WHERE path=? AND version=?", (path, version)).fetchone()
+            result.append({"id": self.file_id(share_id, path), "name": name, "path": name,
+                           "size": stat.st_size, "version": version, "sha256": digest[0] if digest else "",
+                           "full_path": path})
+        for root in share["roots"]:
+            path = root["path"]
+            if root["directory"] and os.path.realpath(path) == path:
+                for directory, dirs, files in os.walk(path):
+                    dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(directory, d)) and
+                                     not self._protected(os.path.realpath(os.path.join(directory, d))))
+                    for name in sorted(files):
+                        full = os.path.join(directory, name)
+                        if self._contains(path, os.path.realpath(full)):
+                            add(full, os.path.basename(path) + "/" + os.path.relpath(full, path).replace(os.sep, "/"))
+            elif not root["directory"]:
+                add(path, os.path.basename(path), explicit=True)
+        if local or share["public_received"]:
+            for row in uploads:
+                add(row["target"], os.path.relpath(row["target"], row["directory"]).replace(os.sep, "/"))
+        return result
+
+    def file(self, share_id, file_id):
+        for item in self.files(share_id):
+            if item["id"] == file_id:
+                return item
+        raise CliError("文件不可用或未获授权", 404)
+
+    def digest(self, item, guard=lambda: None):
+        path, version = item["full_path"], item["version"]
+        cached = self.db.execute("SELECT digest FROM digests WHERE path=? AND version=?", (path, version)).fetchone()
+        if cached:
+            return cached[0]
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                guard()
+                digest.update(block)
+        if file_version(path) != version:
+            raise CliError("文件内容已变化，请重试", 409)
+        value = digest.hexdigest()
+        with self.transaction() as db:
+            db.execute("INSERT OR REPLACE INTO digests VALUES(?,?,?)", (path, version, value))
+        return value
+
+    def texts(self, share_id, local=False):
+        share = self.share(share_id)
+        return [dict(row) for row in self.db.execute(
+            "SELECT id,received,created_at,size FROM texts "
+            "WHERE share_id=? AND (? OR received=0) ORDER BY created_at", (
+                share_id, bool(local or share["public_received"])))]
+
+    def text(self, share_id, text_id, local=False):
+        share = self.share(share_id)
+        row = self.db.execute("SELECT content FROM texts WHERE id=? AND share_id=? AND (? OR received=0)",
+                              (text_id, share_id, bool(local or share["public_received"]))).fetchone()
+        if not row:
+            raise CliError("文本不可用或未获授权", 404)
+        return row[0]
+
+    def add_text(self, share_id, content, auth=None, guard=None):
+        with self.transaction() as db:
+            if auth:
+                if auth["share"]["id"] != share_id:
+                    raise CliError("文本未获授权", 403)
+                self.guard(auth, upload=True)
+            else:
+                self.share(share_id)
+            if guard:
+                guard()
+            return self._insert_text(db, share_id, content, bool(auth))
+
+    def _insert_text(self, db, share_id, content, received):
+        if not isinstance(content, str) or not content.strip() or len(content.encode()) > TEXT_LIMIT:
+            raise CliError("文本不能为空，单条上限为 10 MiB")
+        count = db.execute("SELECT COUNT(*) FROM texts WHERE share_id=?", (share_id,)).fetchone()[0]
+        if count >= TEXT_COUNT:
+            raise CliError("已达到 100 条文本上限，请在本机清理后再提交")
+        text_id = secrets.token_hex(12)
+        db.execute("INSERT INTO texts(id,share_id,received,content,created_at,size) VALUES(?,?,?,?,?,?)",
+                   (text_id, share_id, received, content, time.time(), len(content.encode("utf-8"))))
+        return text_id
+
+    def clear_texts(self, share_id):
+        with self.transaction() as db:
+            self.share(share_id)
+            db.execute("DELETE FROM texts WHERE share_id=?", (share_id,))
+
+    def _partial(self, upload_id):
+        return os.path.join(self.partial_dir, upload_id + ".part")
+
+    def _remove_partial(self, upload_id):
+        try:
+            os.remove(self._partial(upload_id))
+        except FileNotFoundError:
+            pass
+
+    def upload(self, auth, upload_id, name, total, expected, offset, block, guard):
+        if (not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", upload_id) or
+                (expected and not re.fullmatch(r"[0-9a-f]{64}", expected)) or
+                not isinstance(total, int) or not isinstance(offset, int) or
+                not 0 <= offset <= total < 2 ** 63):
+            raise CliError("上传参数不正确")
+        share = self.guard(auth, upload=True)
+        name = safe_relpath(name).replace(os.sep, "/")
+        part = self._partial(upload_id)
+        with self.transaction() as db:
+            self.guard(auth, upload=True)
+            row = db.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
+            if row:
+                if (row["share_id"] != share["id"] or row["visitor"] != auth["visitor"] or
+                        row["name"] != name or row["total"] != total or row["expected"] != expected):
+                    raise CliError("上传标识或文件信息不匹配")
+                if row["cancelled"]:
+                    raise Cancelled("上传已取消")
+                if row["complete"]:
+                    return {"complete": True, "sha256": row["digest"], "name": os.path.basename(row["target"])}
+                actual = os.path.getsize(part) if os.path.isfile(part) else 0
+            else:
+                if offset:
+                    return {"offset": 0, "conflict": True}
+                actual = 0
+                db.execute("INSERT INTO uploads(id,share_id,visitor,name,total,received,expected,directory,updated_at) "
+                           "VALUES(?,?,?,?,?,?,?,?,?)", (upload_id, share["id"], auth["visitor"], name,
+                                                       total, 0, expected, share["collection_dir"], time.time()))
+            if actual != offset:
+                return {"offset": actual, "conflict": True}
+            if offset + len(block) > total:
+                raise CliError("上传数据超出文件大小")
+            with open(part, "ab") as stream:
+                stream.write(block)
+            actual += len(block)
+            db.execute("UPDATE uploads SET received=?,updated_at=? WHERE id=?", (actual, time.time(), upload_id))
+        if actual < total:
+            return {"complete": False, "offset": actual}
+        return self._finish_upload(auth, upload_id, guard)
+
+    def _finish_upload(self, auth, upload_id, guard):
+        with self._lock:
+            if upload_id in self._publishing:
+                return {"complete": False, "publishing": True}
+            self._publishing.add(upload_id)
+        target, owned, published = "", False, False
+        def check():
+            guard()
+            pending = self.db.execute("SELECT cancelled FROM uploads WHERE id=?", (upload_id,)).fetchone()
+            if not pending or pending[0]:
+                raise Cancelled("上传已取消")
+        try:
+            row = self.db.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
+            if row["complete"]:
+                return {"complete": True, "sha256": row["digest"], "name": os.path.basename(row["target"])}
+            part = self._partial(upload_id)
+            relative = safe_relpath(row["name"])
+            directory = os.path.join(row["directory"], os.path.dirname(relative))
+            if not self._contains(row["directory"], os.path.realpath(directory)):
+                raise CliError("收集目录不可用")
+            os.makedirs(directory, exist_ok=True)
+            with self._lock:
+                while True:
+                    target = unique_path(directory, os.path.basename(relative))
+                    try:
+                        descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                        owned = True
+                        break
+                    except FileExistsError:
+                        continue
+                with self.transaction() as db:
+                    stat = os.fstat(descriptor)
+                    db.execute("UPDATE uploads SET target=?,target_key=? WHERE id=?", (
+                        target, f"{stat.st_dev}:{stat.st_ino}", upload_id))
+            with os.fdopen(descriptor, "wb") as dest, open(part, "rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    check()
+                    dest.write(block)
+                dest.flush()
+                os.fsync(dest.fileno())
+            version = file_version(target)
+            checksum = hashlib.sha256()
+            with open(target, "rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    check()
+                    checksum.update(block)
+            digest = checksum.hexdigest()
+            check()
+            if (file_version(target) != version or
+                    (row["expected"] and digest != row["expected"])):
+                raise CliError("文件校验失败，请重新上传", 422)
+            with self.transaction() as db:
+                check()
+                self.guard(auth, upload=True)
+                db.execute("UPDATE uploads SET complete=1,digest=?,updated_at=? WHERE id=?", (
+                    digest, time.time(), upload_id))
+                db.execute("INSERT OR REPLACE INTO digests VALUES(?,?,?)", (target, version, digest))
+            published = True
+            self._remove_partial(upload_id)
+            return {"complete": True, "sha256": digest, "name": os.path.basename(target)}
+        except BaseException as exc:
+            if owned and not published:
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
+                with self.transaction() as db:
+                    db.execute("UPDATE uploads SET target='',target_key='' WHERE id=? AND complete=0", (upload_id,))
+            if isinstance(exc, Cancelled) or getattr(exc, "status", None) == 422:
+                with self.transaction() as db:
+                    db.execute("DELETE FROM uploads WHERE id=? AND complete=0", (upload_id,))
+                self._remove_partial(upload_id)
+            raise
+        finally:
+            with self._lock:
+                self._publishing.discard(upload_id)
+
+    def abort_upload(self, auth, upload_id):
+        with self.transaction() as db:
+            row = db.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
+            if not row or row["complete"]:
+                return
+            if row["share_id"] != auth["share"]["id"] or row["visitor"] != auth["visitor"]:
+                raise CliError("没有权限取消该上传")
+            if upload_id in self._publishing:
+                db.execute("UPDATE uploads SET cancelled=1 WHERE id=?", (upload_id,))
+                return
+            db.execute("DELETE FROM uploads WHERE id=?", (upload_id,))
+            self._remove_partial(upload_id)
+
+    def cleanup(self):
+        with self.transaction() as db:
+            for row in list(db.execute("SELECT id,target,target_key FROM uploads WHERE complete=0 AND updated_at<?",
+                                        (time.time() - PARTIAL_TTL,))):
+                if row["id"] in self._publishing:
+                    continue
+                self._remove_partial(row["id"])
+                if row["target"]:
+                    try:
+                        stat = os.stat(row["target"], follow_symlinks=False)
+                        if row["target_key"] == f"{stat.st_dev}:{stat.st_ino}":
+                            os.remove(row["target"])
+                    except FileNotFoundError:
+                        pass
+                db.execute("DELETE FROM uploads WHERE id=?", (row["id"],))
+            db.execute("DELETE FROM sessions WHERE expires_at<?", (time.time(),))

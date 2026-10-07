@@ -1,14 +1,9 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""landrop 命令行端到端测试：真起服务 → send 多文件 → get 到指定目录 → 校验内容 → revoke。
-
-用法: python3 tests/cli_check.py
-"""
+"""Real CLI processes. Reusable against source, zipapp and installed binaries."""
 from __future__ import annotations
 
-import contextlib
-import io
+import json
 import os
+from pathlib import Path
 import queue
 import re
 import socket
@@ -17,254 +12,149 @@ import sys
 import tempfile
 import threading
 import time
+import unittest
+import urllib.error
+import urllib.request
 
-import faulthandler
-faulthandler.dump_traceback_later(240, exit=True)   # 卡死时打印各线程堆栈并退出，便于 CI 定位
-
-for _s in (sys.stdout, sys.stderr):
-    try:
-        _s.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:  # noqa: BLE001
-        pass
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-from landrop import cli as landrop, common  # noqa: E402
-
-KEY = "cli-test-key"
-FAILED = []
+ROOT = Path(__file__).resolve().parents[1]
+COMMAND = json.loads(os.environ["LANDROP_TEST_COMMAND"]) if os.environ.get("LANDROP_TEST_COMMAND") else [sys.executable, "-u", "-m", "landrop"]
 
 
-def check(cond, msg):
-    print(("  ok   " if cond else "  FAIL ") + msg)
-    if not cond:
-        FAILED.append(msg)
+class CLI(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.data = self.root / "data"
+        self.source = self.root / "source"
+        (self.source / "folder" / "子目录").mkdir(parents=True)
+        self.file = self.source / "big.bin"
+        self.file.write_bytes(os.urandom(2 * 1024 * 1024))
+        (self.source / "folder" / "子目录" / "中文.txt").write_text("Unicode payload", encoding="utf-8")
+        self.process = None
+        self.env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.port = sock.getsockname()[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        self.run_cli("settings", "--port", str(self.port), "--ip", "127.0.0.1",
+                     "--collect-dir", str(self.root / "collected"))
 
+    def tearDown(self):
+        if self.process:
+            if self.process.poll() is None:
+                self.run_cli("stop", check=False)
+                try:
+                    self.process.wait(15)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+            self.process.stdout.close()
+        self.temp.cleanup()
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    def run_cli(self, *args, input=None, check=True):
+        result = subprocess.run([*COMMAND, "--data-dir", str(self.data), *args], cwd=str(ROOT), env=self.env,
+                                input=input, capture_output=True, encoding="utf-8", timeout=60)
+        if check:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
 
-
-def run(argv):
-    out, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        rc = landrop.main(argv)
-    return rc, out.getvalue(), err.getvalue()
-
-
-def start_direct_sender(args):
-    """以子进程启动直连发送端；后台线程读 stdout，避免读管道把测试卡死。"""
-    proc = subprocess.Popen(
-        [sys.executable, "-u", "-m", "landrop", "send", *args, "--ip", "127.0.0.1"], cwd=ROOT,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-        errors="replace", env={**os.environ, "PYTHONIOENCODING": "utf-8"})
-    lines: "queue.Queue[str]" = queue.Queue()
-    threading.Thread(target=lambda: [lines.put(l) for l in proc.stdout], daemon=True).start()
-    code = ""
-    end = time.time() + 20
-    while time.time() < end and not code:
-        try:
-            m = re.search(r"文件码:\s+(\S+)", lines.get(timeout=0.5))
-            code = m.group(1) if m else ""
-        except queue.Empty:
-            if proc.poll() is not None:
-                break
-    return proc, code
-
-
-def direct_checks(tmp):
-    print("\n[直连模式]")
-    src = os.path.join(tmp, "dsrc")
-    os.makedirs(os.path.join(src, "proj", "sub"))
-    payload = os.urandom(400_000)
-    with open(os.path.join(src, "big.bin"), "wb") as f:
-        f.write(payload)
-    with open(os.path.join(src, "proj", "a.txt"), "w") as f:
-        f.write("A")
-    with open(os.path.join(src, "proj", "sub", "b.txt"), "w") as f:
-        f.write("B")
-
-    proc, code = start_direct_sender([os.path.join(src, "big.bin"), os.path.join(src, "proj")])
-    check(bool(code), f"直连 send 输出文件码 {code}")
-    dest = os.path.join(tmp, "direct-out")
-    os.makedirs(dest)
-    with open(os.path.join(dest, "big.bin.part"), "wb") as f:      # 预置断点
-        f.write(payload[:150_000])
-    host, _, tail = code.partition("/")
-    rc, _, _ = run(["get", host + "/wrong-token-xx", "-o", dest])
-    check(rc == 1, "错误令牌被拒绝")
-    rc, out, _ = run(["get", code, "-o", dest])
-    check(rc == 0, "直连 get 成功")
-    check(open(os.path.join(dest, "big.bin"), "rb").read() == payload, "断点续传后内容一致")
-    check(open(os.path.join(dest, "proj", "sub", "b.txt")).read() == "B", "目录结构保留")
-    try:
-        check(proc.wait(timeout=15) == 0, "接收完成后发送端自动退出(0)")
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        check(False, "接收完成后发送端自动退出(0)")
-    rc, _, _ = run(["get", code, "-o", dest])
-    check(rc == 1, "一次性：发送端退出后文件码失效")
-
-    # 错误次数过多 → 发送端自行关闭
-    proc, code = start_direct_sender([os.path.join(src, "big.bin")])
-    host = code.partition("/")[0]
-    for _ in range(5):
-        run(["get", host + "/nope", "-o", dest])
-    try:
-        check(proc.wait(timeout=15) == 1, "连续错误令牌后发送端关闭")
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        check(False, "连续错误令牌后发送端关闭")
-    check(common.safe_relpath("a/b/c.txt") == os.path.join("a", "b", "c.txt"), "safe_relpath 正常路径")
-    try:
-        common.safe_relpath("../../etc/passwd")
-        check(False, "safe_relpath 拒绝 ..")
-    except common.CliError:
-        check(True, "safe_relpath 拒绝 ..")
-
-    # 重名文件不再被静默丢弃：第二个自动带上父目录名
-    dup_dir = os.path.join(src, "dup")
-    os.makedirs(dup_dir)
-    with open(os.path.join(dup_dir, "a.txt"), "w") as f:
-        f.write("D")
-    proc, code = start_direct_sender([os.path.join(src, "proj", "a.txt"),
-                                      os.path.join(dup_dir, "a.txt")])
-    check(bool(code), "重名发送输出文件码")
-    dest2 = os.path.join(tmp, "dup-out")
-    os.makedirs(dest2, exist_ok=True)
-    rc, _, _ = run(["get", code, "-o", dest2])
-    check(rc == 0, "重名发送 get 成功")
-    check(os.path.isfile(os.path.join(dest2, "a.txt")) and
-          open(os.path.join(dest2, "a.txt")).read() == "A", "第一个同名文件原样保存")
-    check(os.path.isfile(os.path.join(dest2, "dup", "a.txt")) and
-          open(os.path.join(dest2, "dup", "a.txt")).read() == "D", "第二个同名文件带父目录名")
-    try:
-        check(proc.wait(timeout=15) == 0, "重名接收完成后发送端退出(0)")
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        check(False, "重名接收完成后发送端退出(0)")
-
-
-def browser_checks(tmp):
-    """文件码当网址用：没装 LAN Drop 的设备用浏览器打开就能下载；下完全部文件发送端自动结束。"""
-    print("\n[直连：浏览器取件]")
-    import http.cookiejar
-    import urllib.request
-    src = os.path.join(tmp, "bsrc")
-    os.makedirs(src)
-    with open(os.path.join(src, "photo.jpg"), "wb") as f:
-        f.write(b"jpegdata")
-    proc, code = start_direct_sender([os.path.join(src, "photo.jpg")])
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-    try:
-        with opener.open("http://" + code, timeout=10) as r:
-            page = r.read().decode("utf-8")
-            check("photo.jpg" in page and r.headers.get("Referrer-Policy") == "no-referrer",
-                  "浏览器打开文件码看到文件列表")
-        with opener.open(f"http://{code.partition('/')[0]}/api/download?id=0", timeout=10) as r:
-            check(r.read() == b"jpegdata" and "photo.jpg" in r.headers.get("Content-Disposition", ""),
-                  "浏览器下载内容与文件名正确")
-        check(proc.wait(timeout=15) == 0, "浏览器下完全部文件后发送端自动结束")
-    except Exception as exc:  # noqa: BLE001
-        check(False, f"浏览器取件：{exc!r}")
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-
-
-def main():
-    tmp = tempfile.mkdtemp(prefix="landrop-cli-")
-    port = free_port()
-    server = f"http://127.0.0.1:{port}"
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "landrop", "serve", "--data-dir", os.path.join(tmp, "data"),
-         "--host", "127.0.0.1", "--port", str(port), "--admin-key", KEY, "--no-banner"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
-    try:
-        for _ in range(100):
-            with socket.socket() as s:
-                if s.connect_ex(("127.0.0.1", port)) == 0:
+    def spawn(self, *args, wait_for="访问地址:"):
+        self.process = subprocess.Popen([*COMMAND, "--data-dir", str(self.data), *args], cwd=str(ROOT),
+                                        env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        encoding="utf-8", bufsize=1)
+        lines = queue.Queue()
+        def pump():
+            for line in self.process.stdout:
+                lines.put(line)
+        threading.Thread(target=pump, daemon=True).start()
+        collected, end = "", time.monotonic() + 30
+        while time.monotonic() < end:
+            try:
+                line = lines.get(timeout=0.2)
+                collected += line
+                if wait_for in line:
+                    return collected
+            except queue.Empty:
+                if self.process.poll() is not None:
                     break
-            time.sleep(0.1)
-        src = os.path.join(tmp, "src")
-        os.makedirs(src)
-        files = {"a.bin": os.urandom(300_000), "中文 name.txt": "你好".encode(), "empty.dat": b""}
-        for name, data in files.items():
-            with open(os.path.join(src, name), "wb") as f:
-                f.write(data)
-        paths = [os.path.join(src, n) for n in files]
+        self.fail("CLI did not start: " + collected)
 
-        rc, out, _ = run(["send", *paths, "--server", server, "--key", KEY, "--expire", "1",
-                          "--max-downloads", "0", "--public-url", server])
-        check(rc == 0, "send 成功")
-        m = re.search(r"文件码:\s+(\S+)", out)
-        code = m.group(1) if m else ""
-        check(bool(code) and code.startswith("127.0.0.1:"), f"输出文件码 {code}")
-        check("get " + code in out, "输出可复制的取件命令")
-        gid = re.search(r"revoke (gs_\w+)", out)
+    def shares(self):
+        return json.loads(self.run_cli("shares", "--json").stdout)
 
-        dest = os.path.join(tmp, "新 目录")
-        rc, out, _ = run(["get", code, "-o", dest])
-        check(rc == 0, "get 成功")
-        for name, data in files.items():
-            p = os.path.join(dest, name)
-            check(os.path.isfile(p) and open(p, "rb").read() == data, f"内容一致：{name}")
+    def test_send_receive_repeat_and_manual_stop(self):
+        output = self.spawn("send", str(self.file), str(self.source / "folder"), "--upload", wait_for="授权码:")
+        code = re.search(r"授权码:\s*([0-9]{6})", output).group(1)
+        destination = self.root / "received"
+        self.run_cli("get", self.base, "--code", code, "-o", str(destination))
+        self.assertEqual((destination / "big.bin").read_bytes(), self.file.read_bytes())
+        self.assertEqual((destination / "folder" / "子目录" / "中文.txt").read_text(encoding="utf-8"), "Unicode payload")
+        self.assertIsNone(self.process.poll(), "Receiving must not stop the service")
+        self.run_cli("get", self.base + "/#code=" + code, "-o", str(destination), "--only", "big.bin")
+        self.assertEqual((destination / "big (1).bin").read_bytes(), self.file.read_bytes())
+        self.run_cli("get", self.base, "--code", code, "-o", str(destination), "--only", "big.bin", "--force")
+        self.assertFalse((destination / "big (2).bin").exists())
+        self.run_cli("stop")
+        self.assertEqual(self.process.wait(15), 0)
+        self.assertTrue(self.file.exists())
+        self.assertEqual(self.shares()[0]["code"], code)
 
-        rc, out, _ = run(["get", code, "-o", dest])
-        check(rc == 0 and os.path.isfile(os.path.join(dest, "a (1).bin")), "同名自动改名")
-        rc, out, _ = run(["get", "extract-me", "--list"])
-        check(rc == 1, "文件码格式错误返回非零")
-        check(common.extract_code(f"python3 landrop.py get {code}  ") == code, "extract_code 认整条命令")
-        check(common.safe_local_name("CON.txt") == "_CON.txt"
-              and common.safe_local_name("a:b?.txt. ") == "a_b_.txt", "Windows 文件名清洗")
+    def test_local_manage_and_guest_collection(self):
+        self.spawn("serve")
+        self.run_cli("send", str(self.file), "--upload", "--public", "--text", "host text")
+        first = self.shares()[0]
+        self.run_cli("put", self.base, str(self.source / "folder"), "--code", first["code"], "--text", "guest text")
+        listing = self.run_cli("get", self.base, "--code", first["code"], "--list").stdout
+        self.assertIn("folder/子目录/中文.txt", listing)
+        self.assertEqual(listing.count("文本 "), 2)
+        directory = Path(first["collection_dir"])
+        self.assertEqual((directory / "folder" / "子目录" / "中文.txt").read_text(encoding="utf-8"), "Unicode payload")
+        self.run_cli("shares", first["id"], "--disable")
+        self.assertNotEqual(self.run_cli("get", self.base, "--code", first["code"], "--list", check=False).returncode, 0)
+        self.run_cli("shares", first["id"], "--enable")
+        self.run_cli("shares", first["id"], "--rotate")
+        rotated = self.shares()[0]
+        self.assertNotEqual(rotated["code"], first["code"])
+        self.assertNotEqual(self.run_cli("get", self.base, "--code", first["code"], "--list", check=False).returncode, 0)
+        self.run_cli("get", self.base, "--code", rotated["code"], "--list")
+        self.assertNotEqual(self.run_cli("shares", first["id"], "--delete", check=False).returncode, 0)
+        self.run_cli("shares", first["id"], "--delete", "--yes")
+        self.assertEqual(self.shares(), [])
+        self.assertTrue(self.file.exists())
+        self.assertTrue(directory.exists())
 
-        rc, _, _ = run(["send", os.path.join(src, "nope"), "--server", server, "--key", KEY])
-        check(rc == 1, "不存在的文件报错")
+    def test_removed_commands_and_settings(self):
+        for command in (("send", "--server", self.base), ("send", "--receivers", "1"),
+                        ("serve", "--admin-key", "obsolete"), ("gui", "--autostart"),
+                        ("get", self.base + "/obsolete-token")):
+            self.assertNotEqual(self.run_cli(*command, check=False).returncode, 0)
+        result = self.run_cli("settings", "--text-preview-mib", "16", "--image-preview-mib", "40")
+        settings = json.loads(result.stdout)
+        self.assertEqual(settings["text_preview_mib"], 16)
+        self.assertEqual(settings["image_preview_mib"], 40)
+        self.assertFalse((self.data / "admin-key.txt").exists())
+        self.assertTrue((self.data / "shares.sqlite3").exists())
 
-        check(gid is not None, "输出授权 ID")
-        rc, _, _ = run(["revoke", gid.group(1), "--server", server, "--key", KEY])
-        check(rc == 0, "revoke 成功")
-        rc, _, err = run(["get", code, "-o", dest])
-        check(rc == 1, "撤销后取件失败")
-        one = os.path.join(src, "a.bin")
-        rc, out, _ = run(["send", one, "--server", server, "--key", KEY, "--public-url", server])
-        code1 = re.search(r"文件码:\s+(\S+)", out).group(1)
-        d1 = os.path.join(tmp, "once")
-        rc, _, _ = run(["get", code1, "-o", d1])
-        check(rc == 0 and os.path.isfile(os.path.join(d1, "a.bin")), "经服务的传输默认一次性：首次取件成功")
-        rc, _, _ = run(["get", code1, "-o", d1])
-        check(rc == 1, "经服务的传输：取完一次后文件码失效")
+    def test_text_stdin_and_maximum(self):
+        self.spawn("serve")
+        self.run_cli("send", "--text", "-", input="a" * (10 * 1024 * 1024))
+        share = self.shares()[0]
+        listing = self.run_cli("get", self.base, "--code", share["code"], "--list").stdout
+        self.assertIn("10.0 MiB", listing)
+        previous = len(self.shares())
+        self.assertNotEqual(self.run_cli("send", "--text", "-", input="a" * (10 * 1024 * 1024 + 1), check=False).returncode, 0)
+        self.assertEqual(len(self.shares()), previous)
 
-        # 文件夹经服务器：与直连一致，保留目录结构
-        tree = os.path.join(tmp, "tree")
-        os.makedirs(os.path.join(tree, "相册", "2024"))
-        with open(os.path.join(tree, "相册", "2024", "a.txt"), "w", encoding="utf-8") as f:
-            f.write("nested")
-        with open(os.path.join(tree, "相册", "cover.txt"), "w", encoding="utf-8") as f:
-            f.write("cover")
-        rc, out, err = run(["send", os.path.join(tree, "相册"), "--server", server, "--key", KEY,
-                            "--public-url", server])
-        check(rc == 0, "send --server 接受文件夹" + ("" if rc == 0 else "：" + err))
-        m = re.search(r"文件码:\s+(\S+)", out)
-        if m:
-            d2 = os.path.join(tmp, "tree-out")
-            rc, _, _ = run(["get", m.group(1), "-o", d2])
-            check(rc == 0 and open(os.path.join(d2, "相册", "2024", "a.txt"), encoding="utf-8").read()
-                  == "nested", "经服务器取回的文件夹结构一致")
-
-        direct_checks(tmp)
-        browser_checks(tmp)
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    print(f"\n{'失败 ' + str(len(FAILED)) + ' 项' if FAILED else '全部通过'}")
-    return 1 if FAILED else 0
+    def test_packaged_web_resources_and_no_management_page(self):
+        self.spawn("serve")
+        with urllib.request.urlopen(self.base + "/", timeout=10) as response:
+            self.assertIn(b"LAN Drop", response.read())
+        with urllib.request.urlopen(self.base + "/logo.png", timeout=10) as response:
+            self.assertTrue(response.read().startswith(b"\x89PNG\r\n\x1a\n"))
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(self.base + "/admin", timeout=10)
+        self.assertEqual(caught.exception.code, 404)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    unittest.main(verbosity=2)

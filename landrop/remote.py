@@ -1,336 +1,309 @@
-"""客户端：连接常驻服务或直连发送端，完成上传 / 下载 / 传输创建。仅标准库。"""
+"""The shared browser/desktop/CLI protocol client. No server or GUI imports."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import http.client
 import http.cookiejar
 import json
 import os
 import secrets
-import sys
+import shutil
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from .common import (CliError, CHUNK, sha256_file, cmd_prefix, collect_entries, default_data_dir,
-                     make_code, normalize_base, parse_code, progress, safe_relpath, unique_path)
+from .common import (CHUNK, Cancelled, CliError, file_version, normalize_base, parse_target,
+                     progress, resolve_data_dir, safe_relpath, sha256_file, unique_path)
+
+
+def _save_json(path, value):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                                     delete=False) as stream:
+        json.dump(value, stream)
+        temporary = stream.name
+    os.replace(temporary, path)
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 class Client:
-    def __init__(self, base: str, cookie_file: str | None = None):
+    def __init__(self, base, data_dir=None):
         self.base = normalize_base(base)
-        self.cookie_file = cookie_file
-        self.range_progress = False
-        self.cookies = http.cookiejar.MozillaCookieJar(cookie_file)
-        if cookie_file and os.path.isfile(cookie_file):
-            try:
-                self.cookies.load(ignore_discard=True)
-            except (OSError, http.cookiejar.LoadError):
-                pass
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self.cookies))
+        self.cache_dir = os.path.join(resolve_data_dir(data_dir)[0], "receivers")
+        os.makedirs(self.cache_dir, mode=0o700, exist_ok=True)
+        self.cookie_file = os.path.join(self.cache_dir, hashlib.sha256(self.base.encode()).hexdigest() + ".cookies")
+        self.cookies = http.cookiejar.MozillaCookieJar(self.cookie_file)
+        try:
+            self.cookies.load(ignore_discard=True)
+        except (OSError, http.cookiejar.LoadError):
+            pass
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
+        self.content = {}
 
-    def request(self, method, path, body=None, headers=None, timeout=60, raw=False):
-        data = None
-        hdrs = dict(headers or {})
+    def request(self, method, path, body=None, headers=None, timeout=300, raw=False):
+        headers = dict(headers or {})
+        if self.content and path not in ("/api/login", "/api/logout"):
+            headers.setdefault("X-LANDrop-Share", self.content["share"]["id"])
         if isinstance(body, (dict, list)):
-            data = json.dumps(body).encode()
-            hdrs["Content-Type"] = "application/json"
-        elif body is not None:
-            data = body
-        req = urllib.request.Request(self.base + path, data=data, method=method, headers=hdrs)
+            body = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
         try:
-            resp = self.opener.open(req, timeout=timeout)
+            response = self.opener.open(urllib.request.Request(
+                self.base + path, data=body, method=method, headers=headers), timeout=timeout)
         except urllib.error.HTTPError as exc:
-            try:
+            with exc:
                 payload = exc.read()
-            except (OSError, http.client.HTTPException):
-                payload = b""
-            finally:
-                exc.close()
             try:
-                msg = json.loads(payload).get("error") or payload.decode(errors="replace")
-            except Exception:
-                msg = payload.decode(errors="replace")
-            err = CliError(f"{method} {path.split('?')[0]} → {exc.code} {msg}".strip())
-            err.status = exc.code  # type: ignore[attr-defined]
-            err.headers = exc.headers  # type: ignore[attr-defined]
-            raise err from None
-        except urllib.error.URLError as exc:
-            raise CliError(f"连接不上 {self.base}：{exc.reason}") from None
-        except (OSError, http.client.HTTPException) as exc:     # 连接被重置 / 对端已关闭等
-            raise CliError(f"与 {self.base} 的连接中断：{exc}") from None
+                message = json.loads(payload).get("error", payload.decode(errors="replace"))
+            except (ValueError, AttributeError):
+                message = payload.decode(errors="replace")
+            error = CliError(message, exc.code)
+            error.headers = exc.headers
+            raise error from None
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+            raise CliError(f"连接中断：{exc}") from None
         if raw:
-            return resp
+            return response
         try:
-            with resp:
-                payload = resp.read()
-        except (OSError, http.client.HTTPException) as exc:
-            raise CliError(f"与 {self.base} 的连接中断：{exc}") from None
-        return json.loads(payload) if payload else {}
+            with response:
+                return json.loads(response.read() or b"{}")
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            raise CliError(f"响应不完整：{exc}") from None
 
-    def login(self, secret: str) -> dict:
-        result = self.request("POST", "/api/login", {"key": secret})
-        self.range_progress = bool(result.get("range_progress"))
-        if self.cookie_file:
-            directory = os.path.dirname(self.cookie_file)
-            os.makedirs(directory, mode=0o700, exist_ok=True)
-            with tempfile.NamedTemporaryFile(dir=directory, delete=False) as f:
-                temporary = f.name
-            try:
-                self.cookies.save(temporary, ignore_discard=True)
-                os.replace(temporary, self.cookie_file)
-            finally:
-                if os.path.exists(temporary):
-                    os.remove(temporary)
-        return result
-
-
-def read_admin_key(data_dir: str | None = None) -> str:
-    """依次尝试：指定目录 → LANDROP_DATA_DIR → ./data → 平台默认数据目录。"""
-    dirs = [data_dir, os.environ.get("LANDROP_DATA_DIR"), "./data", default_data_dir()]
-    for d in filter(None, dirs):
+    def login(self, code):
+        self.content = self.request("POST", "/api/login", {"code": code})
+        with tempfile.NamedTemporaryFile(dir=self.cache_dir, delete=False) as stream:
+            temporary = stream.name
         try:
-            with open(os.path.join(d, "admin-key.txt"), encoding="utf-8") as f:
-                key = f.read().strip()
-            if key:
-                return key
-        except OSError:
-            continue
-    raise CliError("找不到管理员密钥：请用 --key、环境变量 LANDROP_ADMIN_KEY，"
-                   "或 --data-dir 指向含 admin-key.txt 的数据目录")
+            self.cookies.save(temporary, ignore_discard=True)
+            os.replace(temporary, self.cookie_file)
+        finally:
+            _remove(temporary)
+        return self.content
+
+    def refresh(self):
+        self.content = self.request("GET", "/api/files")
+        return self.content
+
+    def text(self, text_id):
+        with self.request("GET", "/api/text?" + urllib.parse.urlencode({"id": text_id}), raw=True) as response:
+            raw = response.read(10 * 1024 * 1024 + 1)
+        if len(raw) > 10 * 1024 * 1024:
+            raise CliError("文本超过单条上限")
+        return raw.decode("utf-8")
+
+    def submit_text(self, content):
+        return self.request("POST", "/api/text", content.encode("utf-8"), {"Content-Type": "text/plain; charset=utf-8"})
 
 
-def upload_file(cli: Client, space_id: str, path: str, on_progress=progress, rel: str = "",
-                should_cancel=None):
-    """上传一个文件；rel 是文件夹里的相对路径（如 ``相册/a.jpg``），服务端据此保留目录结构。"""
-    name = os.path.basename(path)
-    total = os.path.getsize(path)
-    digest = sha256_file(path)
-    upload_id = secrets.token_hex(8)
-    offset = 0
-    params = {"name": name, "id": upload_id, "total": total, "sha256": digest, "space": space_id}
-    if rel and rel != name:
-        params["path"] = rel
-        name = rel
-    q = lambda off: "/api/upload?" + urllib.parse.urlencode(dict(params, offset=off))  # noqa: E731
-
-    def put(block: bytes, off: int):
-        for attempt in range(4):
-            if should_cancel is not None and should_cancel():
-                raise CliError(f"{name}：已取消")
-            try:
-                return cli.request("PUT", q(off), block,
-                                   {"Content-Type": "application/octet-stream"}, timeout=300), off
-            except CliError as exc:
-                status = getattr(exc, "status", None)
-                if status == 409:
-                    expected = exc.headers.get("X-Expected-Offset")
-                    if expected is not None and 0 <= int(expected) <= total and int(expected) != off:
-                        return None, int(expected)
-                    raise
-                if status is not None and status < 500 and status != 429:
-                    raise
-                if attempt == 3:
-                    raise
-                time.sleep(1 + attempt)
-
-    with open(path, "rb") as f:
-        while True:
-            if should_cancel is not None and should_cancel():
-                raise CliError(f"{name}：已取消")
-            f.seek(offset)
-            block = f.read(CHUNK)
-            res, at = put(block, offset)
-            if res is None:
-                offset = at
-                continue
-            offset = at + len(block)
-            on_progress(name, min(offset, total), total)
-            if res.get("complete"):
-                if res.get("sha256") != digest:
-                    raise CliError(f"{name}：服务端摘要与本地不一致")
-                return res
-            if not block and total:
-                raise CliError(f"{name}：上传提前结束")
+def list_remote(address, code="", only=None, data_dir=None):
+    base, code = parse_target(address, code)
+    client = Client(base, data_dir)
+    files = client.login(code)["files"]
+    if only:
+        files = [item for item in files if item["name"] in set(only) or item["id"] in set(only)]
+        if not files:
+            raise CliError("没有匹配的文件")
+    return client, files
 
 
-def send_files(server: str, key: str, paths: list[str], expire_hours: float = 24,
-               label: str = "", public_url: str = "", on_progress=progress,
-               max_downloads: int = 1, should_cancel=None) -> dict:
-    """经常驻服务的一次性传输：建传输 → 上传 → 给出文件码。返回 {code, grant_id, ...}。
-
-    传输到期 / 取够次数 / 被撤销后，服务端会自动连文件一起清理，不会留下空间与授权。
-    should_cancel 为返回 True 的回调（如 GUI 的取消事件），上传在块间检查并及时中止。
-    """
-    entries = collect_entries(paths)
-    if not entries:
-        raise CliError("没有可发送的文件")
-    cli = Client(server)
-    cli.login(key)
-    label = (label or ", ".join(os.path.basename(p.rstrip("/\\")) for p in paths))[:60]
-    tr = cli.request("POST", "/api/transfers", {
-        "label": label, "expires_hours": expire_hours, "max_downloads": max_downloads})["transfer"]
+def upload_file(client, path, on_progress=progress, rel="", should_cancel=None):
+    def check():
+        if should_cancel and should_cancel():
+            raise Cancelled("已取消")
+    name = rel or os.path.basename(path)
+    version, total = file_version(path), os.path.getsize(path)
+    visitor = next((cookie.value for cookie in client.cookies if cookie.name == "ld_visitor"), "")
+    identity = hashlib.sha256((client.base + visitor + client.content["share"]["id"] +
+                               os.path.realpath(path)).encode()).hexdigest()
+    cache = os.path.join(client.cache_dir, identity + ".upload.json")
     try:
-        for full, rel in entries:
-            upload_file(cli, tr["space_id"], full, on_progress, rel, should_cancel)
-    except BaseException:
-        try:                                    # 半途失败：撤销，交给服务端清理
-            cli.request("POST", "/api/grants/revoke", {"id": tr["id"]})
+        with open(cache, encoding="utf-8") as stream:
+            state = json.load(stream)
+    except (OSError, ValueError):
+        state = {}
+    if state.get("version") != version:
+        check()
+        state = {"id": secrets.token_hex(16), "version": version, "sha256": sha256_file(path)}
+        _save_json(cache, state)
+    params = {"id": state["id"], "path": name, "total": total, "sha256": state["sha256"]}
+    offset = 0
+    try:
+        with open(path, "rb") as source:
+            while True:
+                check()
+                if file_version(path) != version:
+                    raise CliError("源文件已变化，请重新发送", 409)
+                source.seek(offset)
+                block = source.read(CHUNK)
+                for attempt in range(4):
+                    check()
+                    try:
+                        result = client.request("PUT", "/api/upload?" + urllib.parse.urlencode(
+                            dict(params, offset=offset)), block, {"Content-Type": "application/octet-stream"})
+                        break
+                    except CliError as exc:
+                        if exc.status == 409 and hasattr(exc, "headers") and exc.headers.get("X-Expected-Offset"):
+                            offset = int(exc.headers["X-Expected-Offset"])
+                            result = None
+                            break
+                        if attempt == 3 or (exc.status and exc.status < 500 and exc.status != 429):
+                            raise
+                        time.sleep(attempt + 1)
+                if result is None:
+                    continue
+                if result.get("complete"):
+                    if result["sha256"] != state["sha256"]:
+                        raise CliError("服务端校验结果不一致")
+                    on_progress(name, total, total)
+                    _remove(cache)
+                    return result
+                offset = result.get("offset", offset + len(block))
+                on_progress(name, offset, total)
+                if result.get("publishing"):
+                    time.sleep(0.2)
+    except (Cancelled, KeyboardInterrupt):
+        try:
+            client.request("DELETE", "/api/upload?" + urllib.parse.urlencode({"id": state["id"]}))
         except CliError:
             pass
+        _remove(cache)
         raise
-    code = make_code(normalize_base(public_url or _public_url(cli) or cli.base), tr["secret"])
-    return {
-        "code": code, "grant_id": tr["id"], "count": len(entries),
-        "bytes": sum(os.path.getsize(full) for full, _ in entries), "expire_hours": expire_hours,
-        "max_downloads": max_downloads, "command": f"{cmd_prefix()} get {code}",
-    }
 
 
-def revoke(server: str, key: str, grant_id: str) -> None:
-    """撤销一个传输 / 分享（命令行 revoke 与窗口里的「撤销文件码」共用）。"""
-    cli = Client(server)
-    cli.login(key)
-    cli.request("POST", "/api/grants/revoke", {"id": grant_id})
-
-
-def _public_url(cli: Client) -> str:
-    """服务端知道自己的对外地址（可能是局域网 IP），比 127.0.0.1 更适合发给别人。"""
-    try:
-        return cli.request("GET", "/api/spaces").get("public_url") or ""
-    except CliError:
-        return ""
-
-
-def download_file(cli: Client, item: dict, directory: str, force: bool,
-                  on_progress=progress, _retry=True) -> str:
-    rel = safe_relpath(item.get("path") or item["name"])
-    name = os.path.basename(rel)
-    target = os.path.join(directory, rel) if force else unique_path(directory, rel)
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    part = target + ".part"
-
-    resume = os.path.getsize(part) if os.path.exists(part) else 0
-    size = int(item.get("size") or 0)
-    if resume and resume >= size:          # 残留分块不可信：从头来
-        resume = 0
-    if resume and cli.range_progress:
-        # Recover only prefix intervals not already witnessed by this receiver's server.
-        ranges = cli.request("GET", "/api/download?" + urllib.parse.urlencode(
-            {"id": item["id"], "progress": "1"}))["ranges"]
-        cursor = 0
-        with open(part, "r+b") as old:
-            for lo, hi in ranges + [[resume, resume]]:
-                stop = min(lo, resume)
-                if cursor < stop:
-                    with cli.request("GET", "/api/download?" + urllib.parse.urlencode({"id": item["id"]}),
-                                     headers={"Range": f"bytes={cursor}-{stop - 1}"},
-                                     timeout=300, raw=True) as prefix:
-                        if prefix.status != 206:
-                            raise CliError(f"{name}：对端未按请求提供断点区间")
-                        old.seek(cursor)
-                        remaining = stop - cursor
-                        while remaining:
-                            try:
-                                block = prefix.read(min(1024 * 1024, remaining))
-                            except (OSError, http.client.HTTPException) as exc:
-                                raise CliError(f"{name}：恢复断点区间失败：{exc}") from None
-                            if not block:
-                                raise CliError(f"{name}：恢复断点区间不完整，请重新运行 get")
-                            old.write(block)
-                            remaining -= len(block)
-                cursor = max(cursor, hi)
-                if cursor >= resume:
-                    break
-    headers = {"Range": f"bytes={resume}-"} if resume else {}
-    resp = cli.request("GET", "/api/download?" + urllib.parse.urlencode({"id": item["id"]}),
-                       headers=headers, timeout=300, raw=True)
-    if resume and resp.status != 206:      # 对端不支持续传
-        resume = 0
-    expect = (resp.headers.get("X-File-SHA256") or item.get("sha256") or "").lower()
-    total = size or (int(resp.headers.get("Content-Length") or 0) + resume)
-    h = hashlib.sha256()
-    if resume:                              # 续传：先把已有部分并入摘要
-        with open(part, "rb") as old:
-            for block in iter(lambda: old.read(1024 * 1024), b""):
-                h.update(block)
-    done = resume
-    with resp, open(part, "ab" if resume else "wb") as f:
-        while True:
-            try:
-                block = resp.read(1024 * 1024)
-            except (OSError, http.client.HTTPException):
-                break                       # 连接中断：按「下载不完整」处理，保留 .part 便于续传
-            if not block:
-                break
-            f.write(block)
-            h.update(block)
-            done += len(block)
-            on_progress(name, done, total)
-    # 网络中断：保留 .part，下次 get 会从断点继续
-    if total and done != total:
-        raise CliError(f"{name}：下载不完整（{done}/{total}），重新运行 get 可续传")
-    if expect and h.hexdigest() != expect:
-        try:
-            os.remove(part)
-        except OSError:
-            pass
-        if resume and _retry:               # 续传拼出的内容不对：整份重下一次
-            return download_file(cli, item, directory, force, on_progress, _retry=False)
-        raise CliError(f"{name}：SHA-256 校验失败，已丢弃")
-    item["verified"] = bool(expect)         # 让调用方如实展示「是否校验过」
-    os.replace(part, target)
-    return target
-
-
-def list_remote(code: str, only=None, wait_ready: float = 600,
-                cookie_file: str | None = None) -> tuple[Client, list[dict]]:
-    base, token = parse_code(code)
-    cli = Client(base, cookie_file)
-    deadline = time.monotonic() + wait_ready
-    noted = False
+def _publish(part, target, force):
+    if force:
+        os.replace(part, target)
+        return target
+    directory, name = os.path.dirname(target), os.path.basename(target)
     while True:
+        target = unique_path(directory, name)
         try:
-            cli.login(token)
-            break
-        except CliError as exc:
-            # 直连发送端在后台计算校验值时返回 503：等它就绪（服务端登录不会 503）
-            if getattr(exc, "status", None) != 503 or time.monotonic() >= deadline:
+            os.link(part, target)
+            _remove(part)
+            return target
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            if exc.errno not in (errno.EPERM, errno.EACCES, errno.EXDEV, errno.ENOTSUP):
                 raise
-            if not noted:
-                print("发送端正在准备校验值，等待…", file=sys.stderr)
-                noted = True
-            time.sleep(2)
-    files = cli.request("GET", "/api/files").get("files", [])
-    if only:
-        wanted = set(only)
-        files = [f for f in files if f["name"] in wanted]
-    if not files:
-        raise CliError("没有可下载的文件（文件码已过期、被撤销或没有匹配）")
-    return cli, files
+        marker = target + ".landrop-pending"
+        owned, marker_owned = False, False
+        try:
+            with open(marker, "xb"):
+                marker_owned = True
+            with open(target, "xb") as output, open(part, "rb") as source:
+                owned = True
+                shutil.copyfileobj(source, output, 1024 * 1024)
+                output.flush()
+                os.fsync(output.fileno())
+            _remove(part)
+            return target
+        except FileExistsError:
+            if not owned:
+                continue
+            raise
+        except BaseException:
+            if owned:
+                _remove(target)
+            raise
+        finally:
+            if marker_owned:
+                _remove(marker)
 
 
-def fetch_files(code: str, directory: str, only=None, force: bool = False,
-                on_progress=progress, on_done=None) -> list[str]:
-    """按文件码把文件下载到 directory，逐个校验 SHA-256；返回落盘路径列表。"""
-    directory = os.path.abspath(os.path.expanduser(directory or "."))
+def download_file(client, item, directory, force=False, on_progress=progress, should_cancel=None, _retry=True):
+    directory = os.path.realpath(directory)
+    relative = safe_relpath(item.get("path") or item["name"])
+    target = os.path.join(directory, relative)
+    parent = os.path.realpath(os.path.dirname(target))
+    if os.path.commonpath((directory, parent)) != directory:
+        raise CliError("保存位置包含越界链接")
+    os.makedirs(parent, exist_ok=True)
+    identity = hashlib.sha256((client.base + item["id"] + target).encode()).hexdigest()[:24]
+    part = os.path.join(parent, ".landrop-" + identity + ".part")
+    metadata = part + ".json"
+    try:
+        with open(metadata, encoding="utf-8") as stream:
+            state = json.load(stream)
+    except (OSError, ValueError):
+        state = {}
+    if state.get("version") != item["version"]:
+        _remove(part)
+    _save_json(metadata, {"version": item["version"]})
+    resume = os.path.getsize(part) if os.path.exists(part) else 0
+    if resume > item["size"]:
+        resume = 0
+    headers = {"Range": f"bytes={resume}-", "If-Range": f'"{item["version"]}"'} if resume and resume < item["size"] else {}
+    if resume == item["size"]:
+        resume = 0
+    digest = hashlib.sha256()
+    if resume:
+        with open(part, "rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+    params = {"id": item["id"], "version": item["version"]}
+    try:
+        with client.request("GET", "/api/download?" + urllib.parse.urlencode(params),
+                            headers=headers, raw=True) as response:
+            expected = response.headers.get("X-File-SHA256", "")
+            if len(expected) != 64 or response.headers.get("ETag") != f'"{item["version"]}"':
+                raise CliError("对端未提供有效的文件版本或校验信息")
+            if resume and response.status != 206:
+                resume, digest = 0, hashlib.sha256()
+            done = resume
+            with open(part, "ab" if resume else "wb") as output:
+                while True:
+                    if should_cancel and should_cancel():
+                        raise Cancelled("已取消")
+                    try:
+                        block = response.read(1024 * 1024)
+                    except (OSError, http.client.HTTPException):
+                        break
+                    if not block:
+                        break
+                    output.write(block)
+                    digest.update(block)
+                    done += len(block)
+                    on_progress(item["name"], done, item["size"])
+                output.flush()
+                os.fsync(output.fileno())
+        if done != item["size"]:
+            raise CliError("下载未完成，可重新接收以续传")
+        if digest.hexdigest() != expected:
+            _remove(part)
+            if resume and _retry:
+                return download_file(client, item, directory, force, on_progress, should_cancel, False)
+            raise CliError("文件校验失败，未保存到目标文件")
+        target = _publish(part, target, force)
+        _remove(metadata)
+        return target
+    except (Cancelled, KeyboardInterrupt):
+        _remove(part)
+        _remove(metadata)
+        raise
+
+
+def fetch_files(address, directory, only=None, force=False, on_progress=progress, on_done=None,
+                code="", data_dir=None, should_cancel=None):
+    directory = os.path.abspath(os.path.expanduser(directory))
     os.makedirs(directory, exist_ok=True)
-    identity = hashlib.sha256((code + "\n" + directory).encode()).hexdigest()
-    cookie_file = os.path.join(default_data_dir(), "receivers", identity + ".cookies")
-    cli, files = list_remote(code, only, cookie_file=cookie_file)
-    # Finish the pickup on the last file, not midway through a retry of a partial batch.
-    files.sort(key=lambda item: not item.get("received", False))
+    client, files = list_remote(address, code, only, data_dir)
+    if not files:
+        raise CliError("当前分享没有文件，可在页面查看或提交文本")
     saved = []
     for item in files:
-        target = download_file(cli, item, directory, force, on_progress)
+        target = download_file(client, item, directory, force, on_progress, should_cancel)
         saved.append(target)
         if on_done:
             on_done(item, target)
-    try:                                    # 直连发送端据此结束；中心化服务没有该接口，忽略
-        cli.request("POST", "/api/done", {})
-    except CliError:
-        pass
     return saved

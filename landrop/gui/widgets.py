@@ -312,37 +312,6 @@ class Canvas(tk.Canvas, Themed):
 
 
 # =========================================================================== 卡片
-class Card(Canvas):
-    """圆角卡片：card.body 是放内容的 Frame，高度随内容自动变化。"""
-
-    def __init__(self, parent, padding=18, radius=16, fill="surface", border="line", **kw):
-        super().__init__(parent, **kw)
-        self.fill_role, self.border_role = fill, border
-        self.pad, self.radius = T.px(padding), T.px(radius)
-        self.body = frame(self, bg=fill)
-        self._win = self.create_window(self.pad, self.pad, window=self.body, anchor="nw")
-        self.bind("<Configure>", self._redraw)
-        self.body.bind("<Configure>", self._fit)
-
-    def _fit(self, _e=None):
-        h = self.body.winfo_reqheight() + 2 * self.pad
-        if int(self.cget("height")) != h:
-            self.configure(height=h)
-
-    def _redraw(self, _e=None):
-        w, h = self.winfo_width(), self.winfo_height()
-        self.itemconfigure(self._win, width=max(1, w - 2 * self.pad))
-        self.delete("bgshape")
-        rounded(self, 0, 0, w, h, self.radius, T.c[self.fill_role],
-                T.c[self.border_role] if self.border_role else None, max(1, T.px(1)),
-                bg_of(self.master), tags=("bgshape",))
-        self.tag_lower("bgshape")
-
-    def recolor(self):
-        self.sync_bg()
-        self._redraw()
-
-
 # =========================================================================== 按钮
 class Button(Canvas):
     """kind: primary（主色）/ secondary（浅底）/ ghost（透明）/ danger / soft（主色浅底）"""
@@ -844,46 +813,6 @@ class Select(Canvas):
 
 
 # =========================================================================== 杂项
-class Pill(Canvas):
-    """小标签：kind = accent / muted / warn / danger"""
-
-    def __init__(self, parent, text="", kind="muted", dot=False, **kw):
-        self._h = T.px(22)
-        super().__init__(parent, height=self._h, **kw)
-        self.text, self.kind, self.dot = text, kind, dot
-        self.set(text, kind)
-
-    def set(self, text=None, kind=None):
-        import tkinter.font as tkfont
-        if text is not None:
-            self.text = text
-        if kind is not None:
-            self.kind = kind
-        w = tkfont.Font(font=T.font(9, "bold")).measure(self.text) + T.px(20) + (T.px(12) if self.dot else 0)
-        self.configure(width=w)
-        self.draw()
-
-    def draw(self):
-        self.delete("all")
-        c = T.c
-        bg = bg_of(self.master)
-        self.configure(bg=bg)
-        fill, fg = {"accent": (c["accent_soft"], c["accent_text"]), "warn": (c["warn_soft"], c["warn"]),
-                    "danger": (c["danger_soft"], c["danger"])}.get(self.kind, (c["surface3"], c["text2"]))
-        w, h = int(self.cget("width")), self._h
-        rounded(self, 0, 0, w, h, h // 2, fill, None, 1, bg)
-        x = T.px(10)
-        if self.dot:
-            d = T.px(7)
-            dotc = {"accent": c["accent"], "warn": c["warn"], "danger": c["danger"]}.get(self.kind, c["muted"])
-            rounded(self, x, (h - d) // 2, x + d, (h - d) // 2 + d, d // 2, dotc, None, 1, fill)
-            x += d + T.px(5)
-        self.create_text(x, h // 2, text=self.text, fill=fg, font=T.font(9, "bold"), anchor="w")
-
-    def recolor(self):
-        self.draw()
-
-
 class Icon(Canvas):
     """单独的图标，可选圆角底块（用于文件类型、页面标题）。"""
 

@@ -2,14 +2,13 @@
 """与操作系统打交道的部分：打开文件/网址、窗口设置的保存、把自带的命令行加到 PATH。"""
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
 import sys
 import webbrowser
 
-from landrop.common import app_dir, default_data_dir, portable_dir
+from landrop.common import app_dir, portable_dir
 
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -25,38 +24,6 @@ def open_path(path: str):
 
 def open_url(url: str):
     webbrowser.open(url)
-
-
-# --------------------------------------------------------------------------- 设置
-def settings_path() -> str:
-    base = os.environ.get("LANDROP_DATA_DIR") or default_data_dir()
-    return os.path.join(base, "desktop.json")
-
-
-def load_settings() -> dict:
-    try:
-        with open(settings_path(), encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def save_settings(data: dict):
-    path = settings_path()
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except OSError:
-        pass
-
-
-def default_download_dir() -> str:
-    d = os.path.join(os.path.expanduser("~"), "Downloads")
-    return d if os.path.isdir(d) else os.path.expanduser("~")
 
 
 # --------------------------------------------------------------------------- 命令行工具

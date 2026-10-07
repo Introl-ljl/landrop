@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "landrop"
 dynamic = ["version"]
-description = "LAN file transfer: direct file-code send/get, plus a self-hosted collection server. Zero dependencies."
+description = "Local LAN shares and collection with six-digit access codes. Zero runtime dependencies."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -33,4 +33,4 @@ version = { attr = "landrop.__version__" }
 include = ["landrop*"]
 
 [tool.setuptools.package-data]
-"landrop.server" = ["static/*.html"]
+"landrop.server" = ["static/*"]

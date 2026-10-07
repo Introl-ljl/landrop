@@ -40,7 +40,8 @@ APP_ID = "io.github.introl-ljl.landrop"
 
 PORTABLE_NOTE = """LAN Drop 免安装版 / portable
 
-本文件存在时，LAN Drop 把数据（收集服务的状态库、文件、管理员密钥）保存在同目录的 data/ 下，
+本文件存在时，LAN Drop 把分享配置、文本和本机状态保存在同目录的 data/ 下，
+分享的原文件不复制，收集文件保存在指定的收集目录。
 整个文件夹拷到其他电脑或 U 盘即可继续使用。删除本文件则改用系统默认数据目录。
 
 While this file exists, LAN Drop keeps its data in ./data next to the program,
@@ -159,8 +160,8 @@ Type=Application
 Name=LAN Drop
 GenericName=LAN File Transfer
 GenericName[zh_CN]=局域网文件互传
-Comment=Send files across the LAN with a file code, or collect files from browsers
-Comment[zh_CN]=用文件码在局域网内互传文件，或用浏览器收集文件
+Comment=Share files and text on the LAN with six-digit access codes, or collect from browsers
+Comment[zh_CN]=用六位授权码在局域网内分享文件和文本，或用浏览器收集文件
 Exec={exec} %F
 Icon=landrop
 Terminal=false
@@ -173,7 +174,7 @@ StartupWMClass=Landrop
 APPRUN = """#!/bin/sh
 # 不带参数（或 --smoke-test）打开窗口；带参数就是命令行：./LANDrop.AppImage send a.zip
 HERE="$(dirname "$(readlink -f "$0")")"
-if [ $# -eq 0 ] || [ "$1" = "--smoke-test" ] || [ "$1" = "--autostart" ]; then
+if [ $# -eq 0 ] || [ "$1" = "--smoke-test" ]; then
   exec "$HERE/usr/lib/landrop/landrop-gui" "$@"
 fi
 exec "$HERE/usr/lib/landrop/landrop" "$@"
@@ -249,10 +250,10 @@ def package_linux(out: str, arch: str) -> list[str]:
             f"Installed-Size: {size_kb}\n"
             "Maintainer: LAN Drop contributors <noreply@github.com>\n"
             "Homepage: https://github.com/Introl-ljl/landrop\n"
-            "Description: LAN file transfer with file codes, plus a self-hosted collection server\n"
+            "Description: Local LAN shares and collection with six-digit access codes\n"
             " Desktop window (landrop-gui) and command line (landrop) in one package:\n"
-            " send files directly with a one-time file code, receive them with the code,\n"
-            " or run a browser-based collection server for your LAN.\n")
+            " share files and folders from one local service, receive them with an access code,\n"
+            " and collect files or text through a browser.\n")
     refresh = ("if command -v update-desktop-database >/dev/null 2>&1; then\n"
                "  update-desktop-database -q /usr/share/applications || true\nfi\n")
     icons = ("if command -v gtk-update-icon-cache >/dev/null 2>&1; then\n"

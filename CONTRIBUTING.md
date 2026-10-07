@@ -1,38 +1,30 @@
-# Contributing / 参与贡献
+# 开发约定
 
-Thanks for helping! / 欢迎提 issue 和 PR。
+- 运行时仅使用 Python 3.8+ 标准库。GUI 使用 tkinter，Pillow 只用于测试截图。
+- `server/store.py` 是唯一分享状态层，`server/app.py` 是唯一 HTTP 服务；本机 GUI 与 CLI 直接管理本地状态，不增加 LAN 管理接口、管理员凭证或另一套传输引擎。
+- `remote.py`、`common.py` 和 `qr.py` 不导入 GUI 或服务器，客户端协议与本机管理分离。
+- 新功能先对照 `ADR.md`；不重新引入空间、一次性取件次数、完整文本编辑器或后台自启。访客删除仍待决策，重新讨论并确认前不实现。
+- 用户可见行为须在桌面、CLI、网页相应入口对齐；权限、路径边界和传输中断都在服务端执行，不能仅靠隐藏按钮。
+- 文件与文本列表只返回元信息，完整文本按条加载；ZIP 和媒体不整份读入内存。
+- 原文件和完成收集的文件不因停用、过期、换码或删除分享而自动删除。旧状态先备份，不默默沿用旧凭证。
+- 采用现有控件、颜色令牌和标准库 API，避免泛化框架、平行状态来源及为了兼容已移除能力而增加分支。
 
-## Ground rules / 约定
-- **Zero third-party runtime dependencies** — server, CLI and desktop launcher use the Python
-  standard library only (Python 3.8+). 运行时不引入第三方依赖。
-- Permissions are enforced **server-side**; any new endpoint needs a positive and a negative case in
-  `tests/smoke.py`. 权限必须在服务端裁决，新接口请补正反用例。
-- `landrop/common.py`, `direct.py`, `remote.py` and `qr.py` (the client side) must not import from `landrop/server` or
-  `landrop/gui`, so the client stays usable on its own (`landrop.pyz`). 客户端部分不得依赖服务端/GUI。
-- **One app, two entry points.** The desktop window and the `landrop` CLI ship together in every package and must
-  stay feature-equivalent: a new transfer option goes into both (`cli.py` and `gui/panels.py`), backed by the same
-  function in `direct.py` / `remote.py`. 窗口与命令行是同一个程序的两个入口，功能要对齐。
-- GUI colors come from `landrop/gui/theme.py`, which mirrors the web UI tokens in `server/static/index.html`;
-  change both together. 桌面与网页共用一套配色。
+## 验证
 
-## Dev setup / 本地开发
 ```bash
-python3 -m landrop serve --data-dir ./data   # run the server
-python3 tests/smoke.py                       # server: permissions, checksums, resume, transfers, migration
-python3 tests/cli_check.py                   # CLI: direct send/get, via-server send, revoke
-python3 tests/transfer_check.py              # transfer coverage and real HTTP fault recovery
-xvfb-run -a python3 tests/gui_check.py       # GUI (Linux needs xvfb; macOS/Windows run it directly)
-python3 -m landrop gui                       # desktop window (needs tkinter)
-
-pip install pyinstaller                      # packaging, on the target OS
-pyinstaller --clean --noconfirm landrop.spec # dist/LANDrop: window + CLI sharing one runtime
-python3 packaging/package.py                 # dist/release: setup + portable for this platform
-python3 tests/package_check.py --cli dist/LANDrop/landrop --gui dist/LANDrop/landrop-gui
+python3 tests/smoke.py
+python3 tests/cli_check.py
+python3 tests/transfer_check.py
+xvfb-run -a python3 tests/gui_check.py
 ```
-CI runs the tests on Linux, macOS and Windows, then builds, installs, checks and uninstalls the packages on every
-platform (`.github/workflows/build.yml`). Windows installers need Inno Setup 6.5+ (`choco install innosetup`).
 
-## Releases / 发布
-Bump `landrop/__init__.py`, push a tag `vX.Y.Z`; the `release` workflow builds the setup + portable packages
-for Windows / macOS (arm64, x86_64) / Linux (x86_64, arm64) plus `landrop.pyz`, publishes a GitHub Release with
-`SHA256SUMS`, and pushes a Docker image to GHCR. Running the workflow manually only builds and verifies.
+`smoke.py` 使用真实 HTTP 请求验证 ADR；`transfer_check.py` 注入中断和文件/权限变化；GUI 测试驱动真实控件。Mac/Windows 直接运行 GUI 测试。
+
+```bash
+python3 packaging/build_pyz.py /tmp/landrop.pyz
+python3 tests/package_check.py --cli /tmp/landrop.pyz
+pyinstaller --clean --noconfirm landrop.spec
+xvfb-run -a python3 tests/package_check.py --cli dist/LANDrop/landrop --gui dist/LANDrop/landrop-gui
+```
+
+打包检查通过 `LANDROP_TEST_COMMAND` 将同一 CLI 合同测试指向实际产物，不另维护一套不同的期望。`.github/workflows/ci.yml` 与 `build.yml` 保留多平台测试、构建、安装和卸载验证。

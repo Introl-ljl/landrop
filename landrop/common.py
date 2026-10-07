@@ -1,15 +1,25 @@
-"""共用小工具：错误类型、控制台、文件码、路径清洗、进度显示。仅标准库。"""
+"""Shared paths, addresses, file versions and console helpers. Standard library only."""
 from __future__ import annotations
 
 import hashlib
 import os
 import re
+import shlex
+import socket
 import sys
+import threading
+from urllib.parse import parse_qs, urlsplit
 
 CHUNK = 8 * 1024 * 1024
 
 
 class CliError(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+class Cancelled(CliError):
     pass
 
 
@@ -45,7 +55,7 @@ def portable_dir() -> str | None:
 
 
 def default_data_dir() -> str:
-    """数据目录的唯一约定（窗口、``landrop serve``、``send --server`` 读密钥都用它）。"""
+    """The desktop and local CLI share one private data directory."""
     portable = portable_dir()
     if portable:
         return os.path.join(portable, "data")
@@ -66,7 +76,8 @@ def resolve_data_dir(explicit: str | None = None) -> tuple[str, str]:
     if env:
         return os.path.abspath(os.path.expanduser(env)), "LANDROP_DATA_DIR"
     legacy = os.path.abspath("data")
-    if os.path.isfile(os.path.join(legacy, "state.sqlite3")) and not portable_dir():
+    if any(os.path.isfile(os.path.join(legacy, name)) for name in
+           ("shares.sqlite3", "state.sqlite3")) and not portable_dir():
         return legacy, "当前目录已有的 ./data（旧版默认位置）"
     return default_data_dir(), "默认位置"
 
@@ -111,34 +122,96 @@ def progress_end():
 
 
 def normalize_base(url: str) -> str:
-    url = url.strip().rstrip("/")
+    url = url.strip()
     if not re.match(r"^https?://", url):
         url = "http://" + url
-    return url
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname or
+                parsed.username or parsed.password or parsed.path not in ("", "/") or
+                parsed.query or any(ch.isspace() for ch in parsed.netloc) or
+                (port is not None and not 1 <= port <= 65535)):
+            raise ValueError
+    except ValueError:
+        raise CliError("访问地址格式不正确，请输入 IP:端口或分享链接") from None
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def make_code(base: str, token: str) -> str:
-    """文件码 = 服务地址(去掉 http://) + '/' + 令牌；https 地址保留协议前缀。"""
-    host = base[len("http://"):] if base.startswith("http://") else base
-    return f"{host}/{token}"
+def make_link(base: str, code: str) -> str:
+    return normalize_base(base) + "/#code=" + code
 
 
-def parse_code(code: str) -> tuple[str, str]:
-    code = code.strip()
-    m = re.match(r"^(https?://)?([^/\s]+)/([A-Za-z0-9_-]+)$", code)
-    if not m:
-        raise CliError("文件码格式不对，应形如 192.168.1.5:8000/令牌")
-    return (m.group(1) or "http://") + m.group(2), m.group(3)
+def parse_target(address: str, code: str = "") -> tuple[str, str]:
+    raw = address.strip()
+    found = re.search(r"https?://[^\s]+", raw)
+    address = found.group(0) if found else raw
+    parsed = urlsplit(address if "://" in address else "http://" + address)
+    value = code or (parse_qs(parsed.fragment).get("code") or [""])[0]
+    if not value:
+        match = re.search(r"授权码\s*[:：]\s*([0-9]{6})(?![0-9])", raw)
+        value = match.group(1) if match else ""
+    if not re.fullmatch(r"[0-9]{6}", str(value)):
+        raise CliError("请输入六位数字授权码或分享链接；旧式文件码不再支持")
+    return normalize_base(address), str(value)
 
 
-def extract_code(text: str) -> str:
-    """从粘贴内容里抠出文件码：整条取件命令、带引号的、多余空白都能认。"""
-    m = re.search(r"(?:https?://)?[\w.\-\[\]:]+:\d+/[A-Za-z0-9_-]+", text or "")
-    return m.group(0) if m else (text or "").strip()
+def default_download_dir() -> str:
+    path = os.path.expanduser("~/Downloads")
+    if sys.platform.startswith("win"):
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as key:
+                path = os.path.expandvars(winreg.QueryValueEx(
+                    key, "{374DE290-123F-4565-9164-39C4925E467B}")[0])
+        except OSError:
+            pass
+    elif sys.platform != "darwin":
+        config = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                              "user-dirs.dirs")
+        try:
+            with open(config, encoding="utf-8") as stream:
+                for line in stream:
+                    if line.startswith("XDG_DOWNLOAD_DIR="):
+                        values = shlex.split(line.partition("=")[2])
+                        if values:
+                            path = os.path.expandvars(values[0])
+        except (OSError, ValueError):
+            pass
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def lan_addresses() -> list[str]:
+    found = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as conn:
+            conn.connect(("10.255.255.255", 1))
+            found.append(conn.getsockname()[0])
+    except OSError:
+        pass
+    def lookup():
+        try:
+            found.extend(socket.gethostbyname_ex(socket.gethostname())[2])
+        except OSError:
+            pass
+    worker = threading.Thread(target=lookup, daemon=True)
+    worker.start()
+    worker.join(1)
+    return list(dict.fromkeys(ip for ip in found if not ip.startswith("127."))) or ["127.0.0.1"]
+
+
+def file_version(path: str) -> str:
+    return stat_version(os.stat(path))
+
+
+def stat_version(stat) -> str:
+    return hashlib.sha256(str((stat.st_dev, stat.st_ino, stat.st_size,
+                               stat.st_mtime_ns, stat.st_ctime_ns)).encode()).hexdigest()[:32]
 
 
 def collect_entries(paths: list[str], on_warning=None) -> list[tuple[str, str]]:
-    """把要发送的文件/文件夹展开成 [(本地路径, 相对名)]。直连与经服务器共用，行为一致：
+    """把要发送的文件/文件夹展开成 [(本地路径, 相对名)]：
     文件用文件名，文件夹保留「文件夹名/子路径」结构；重名自动区分。"""
     entries, seen, out = [], set(), []
     for p in paths:
@@ -146,10 +219,10 @@ def collect_entries(paths: list[str], on_warning=None) -> list[tuple[str, str]]:
         if os.path.isdir(p):
             top = os.path.basename(p.rstrip("/\\")) or "folder"
             for root, dirs, files in os.walk(p):
-                dirs.sort()
+                dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(root, d)))
                 for fn in sorted(files):
                     full = os.path.join(root, fn)
-                    if os.path.isfile(full):
+                    if os.path.isfile(full) and not os.path.islink(full):
                         entries.append((full, top + "/" + os.path.relpath(full, p).replace(os.sep, "/")))
         elif os.path.isfile(p):
             entries.append((p, os.path.basename(p)))
@@ -170,17 +243,6 @@ def collect_entries(paths: list[str], on_warning=None) -> list[tuple[str, str]]:
         seen.add(rel)
         out.append((full, rel))
     return out
-
-
-def merge_ranges(ranges, start: int, stop: int) -> list[list[int]]:
-    """Merge overlapping half-open byte intervals, including adjacent intervals."""
-    merged = []
-    for lo, hi in sorted(list(ranges) + ([[start, stop]] if stop > start else [])):
-        if merged and lo <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], hi)
-        else:
-            merged.append([lo, hi])
-    return merged
 
 
 def unique_path(directory: str, name: str) -> str:
@@ -205,12 +267,18 @@ def safe_local_name(name: str) -> str:
         name = "download"
     if name.split(".")[0].upper() in _WIN_RESERVED:
         name = "_" + name
+    if len(name.encode("utf-8")) > 200:
+        stem, ext = os.path.splitext(name)
+        ext = ext.encode("utf-8")[:40].decode("utf-8", "ignore")
+        name = stem.encode("utf-8")[:200 - len(ext.encode("utf-8"))].decode("utf-8", "ignore") + ext
     return name
 
 
 def safe_relpath(rel: str) -> str:
     """把对端给的相对路径清洗成本地安全路径：逐段清洗，拒绝 ..、空段与绝对路径。"""
-    parts = [p for p in rel.replace("\\", "/").split("/") if p not in ("", ".")]
-    if not parts or any(p == ".." for p in parts):
+    raw = rel.replace("\\", "/")
+    parts = [p for p in raw.split("/") if p not in ("", ".")]
+    if (not parts or len(parts) > 32 or raw.startswith("/") or re.match(r"^[A-Za-z]:", raw)
+            or any(p == ".." for p in parts)):
         raise CliError(f"不安全的路径：{rel!r}")
     return os.path.join(*[safe_local_name(p) for p in parts])
